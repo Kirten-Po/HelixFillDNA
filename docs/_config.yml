@@ -6,10 +6,10 @@ theme: minima
 
 # ⚠ Плейсхолдер: замените <owner> на реальный аккаунт/организацию
 # после публикации репозитория на GitHub.
-url: "https://<owner>.github.io"
+url: "https://Kirten-Po.github.io"
 baseurl: "/HelixFillDNA"
 
-repository: <owner>/HelixFillDNA
+repository: Kirten-Po/HelixFillDNA
 
 # Сайт лежит в docs/ основной ветки — включать нужно в настройках
 # репозитория: Settings → Pages → Source → Deploy from a branch →
