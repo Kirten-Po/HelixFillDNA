@@ -1,0 +1,18 @@
+title: HelixFillDNA
+description: >-
+  Конвертация сырых данных ДНК (FTDNA / MyHeritage / VCF) в формат
+  23andMe для импутации и загрузки в Генотек.
+theme: minima
+
+# ⚠ Плейсхолдер: замените <owner> на реальный аккаунт/организацию
+# после публикации репозитория на GitHub.
+url: "https://<owner>.github.io"
+baseurl: "/HelixFillDNA"
+
+repository: <owner>/HelixFillDNA
+
+# Сайт лежит в docs/ основной ветки — включать нужно в настройках
+# репозитория: Settings → Pages → Source → Deploy from a branch →
+# Branch: main, Folder: /docs.
+
+markdown: kramdown

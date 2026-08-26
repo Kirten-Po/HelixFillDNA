@@ -1,0 +1,54 @@
+name: Release
+
+# Запускается на пуш тега вида v1.0.0, v1.2.3 и т.п.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build-windows-installer:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Достаём версию из тега (v1.2.3 -> 1.2.3), используем и для
+      # ISCC /DMyAppVersion, и для имени файла в Release.
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build executable with PyInstaller
+        run: python -m PyInstaller HelixFillDNA.spec
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            HelixFillDNA.iss `
+            /DMyAppVersion=${{ steps.version.outputs.version }}
+
+      # ВАЖНО: путь ниже (Output/HelixFillDNA-Setup-*.exe) — стандартный
+      # для Inno Setup, но зависит от OutputDir/OutputBaseFilename в
+      # HelixFillDNA.iss. Проверьте и поправьте под реальные настройки.
+      - name: Upload installer to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Output/HelixFillDNA-Setup-${{ steps.version.outputs.version }}.exe
