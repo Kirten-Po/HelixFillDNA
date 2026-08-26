@@ -2,12 +2,9 @@
 
 Десктопное приложение для Windows, которое конвертирует сырые данные ДНК
 (экспорт **FamilyTreeDNA**, **MyHeritage** или готовый **VCF**) в формат
-**23andMe**, пригодный для импутации на **Michigan Imputation Server** и
+**23andMe**, пригодный для импутации на **Michigan Imputation Server** и 
+**TOPMed Imputation Server** для
 последующей загрузки в **Генотек**.
-
-> ⚠️ Проект в разработке. Ссылки на релизы и репозиторий ниже —
-> плейсхолдеры (`<owner>/<repo>`), замените на реальные после публикации
-> на GitHub.
 
 ## Скриншоты
 
@@ -50,7 +47,7 @@ HelixFillDNA автоматизирует весь этот процесс — �
 
 ### Вариант 1 — готовый установщик (рекомендуется)
 
-1. Откройте раздел [Releases](https://github.com/<owner>/<repo>/releases)
+1. Откройте раздел [Releases](https://github.com/Kirten-Po/HelixFillDNA/releases)
    репозитория.
 2. Скачайте последний `HelixFillDNA-Setup-X.Y.Z.exe`.
 3. Запустите установщик — права администратора **не требуются**
@@ -64,7 +61,7 @@ HelixFillDNA автоматизирует весь этот процесс — �
 ### Вариант 2 — из исходников
 
 ```bash
-git clone https://github.com/<owner>/<repo>.git
+git clone https://github.com/Kirten-Po/HelixFillDNA.git
 cd <repo>
 pip install -r requirements.txt   # customtkinter, pyfaidx и др.
 python gui/app.py                 # запуск GUI
