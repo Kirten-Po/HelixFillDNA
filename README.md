@@ -50,7 +50,7 @@ HelixFillDNA автоматизирует весь этот процесс — �
 
 ### Вариант 1 — готовый установщик (рекомендуется)
 
-1. Откройте раздел [Releases](https://github.com/<owner>/<repo>/releases)
+1. Откройте раздел [Releases](https://github.com/Kirten-Po/HelixFillDNA/releases)
    репозитория.
 2. Скачайте последний `HelixFillDNA-Setup-X.Y.Z.exe`.
 3. Запустите установщик — права администратора **не требуются**
@@ -64,7 +64,7 @@ HelixFillDNA автоматизирует весь этот процесс — �
 ### Вариант 2 — из исходников
 
 ```bash
-git clone https://github.com/<owner>/<repo>.git
+git clone https://github.com/Kirten-Po/HelixFillDNA.git
 cd <repo>
 pip install -r requirements.txt   # customtkinter, pyfaidx и др.
 python gui/app.py                 # запуск GUI
