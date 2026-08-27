@@ -85,6 +85,7 @@ import logging
 import os
 import pickle
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -198,6 +199,43 @@ import download_donors
 from adapters.ftdna_v3 import ReferenceGenome
 from core import archive_utils
 from core import network_utils
+
+
+# ---------------------------------------------------------------------------
+# Промт "простой лог скачивания — одна обновляющаяся строка на файл":
+# _pump_progress() в download_donors.py прореживает вывод aria2c/curl по
+# времени (не чаще раза в 2с НА ОДИН файл), но при нескольких хромосомах,
+# качающихся параллельно (DEFAULT_PARALLEL_CHROMOSOMES), плюс отдельные
+# .tbi-индексы — в лог всё равно сыпались десятки перемежающихся строк
+# вида "aria2c ALL.chr14...: [...41%...]". Ниже — распознавание таких
+# строк по регэкспу и обновление ОДНОЙ и той же строки в логе (через
+# именованные метки Tkinter Text, а не insert("end", ...)) вместо
+# добавления новой на каждое обновление процента. Ключ — номер хромосомы
+# + тип файла (сам VCF донора или его .tbi-индекс), поэтому при
+# параллельном скачивании нескольких хромосом каждая держит свою строку.
+_CHR_PROGRESS_RE = re.compile(r"ALL\.chr(\d+)\.")
+_PERCENT_RE = re.compile(r"(\d{1,3})%")
+
+
+def _parse_progress_line(msg: str) -> tuple[str, str] | None:
+    """
+    Возвращает (ключ, текст_для_показа) для строки прогресса скачивания
+    конкретной хромосомы (aria2c/curl), либо None, если msg — обычное
+    сообщение (этап, ошибка, готово и т.п.), которое нужно просто
+    добавить в лог как есть.
+    """
+    if "ALL.chr" not in msg:
+        return None
+    chr_match = _CHR_PROGRESS_RE.search(msg)
+    pct_match = _PERCENT_RE.search(msg)
+    if not chr_match or not pct_match:
+        return None
+    chrom = chr_match.group(1)
+    is_index = ".tbi" in msg
+    key = f"chr{chrom}_idx" if is_index else f"chr{chrom}"
+    kind = "индекс" if is_index else "донор"
+    text = f"⬇ chr{chrom} ({kind}): {pct_match.group(1)}%"
+    return key, text
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +523,9 @@ class App(ctk.CTk):
         self.current_run_name: str | None = None
         self._run_log_handler = None  # logging.Handler, снимается при смене запуска
         self._run_history_map: dict[str, Path] = {}  # подпись в списке -> папка запуска
+        # Ключи ("chr14", "chr14_idx", ...), для которых в log_text уже
+        # создана обновляемая строка прогресса (см. _upsert_progress_line).
+        self._progress_keys: set[str] = set()
 
         self.tabview = ctk.CTkTabview(self)
         self.tabview.pack(fill="both", expand=True, padx=10, pady=10)
@@ -1098,6 +1139,10 @@ class App(ctk.CTk):
 
     def _clear_log(self):
         self.log_text.delete("1.0", "end")
+        # Метки прогресса ссылались на позиции внутри только что стёртого
+        # текста — без сброса следующий _upsert_progress_line() решил бы,
+        # что метка ещё жива, и мог бы обновить не ту строку.
+        self._progress_keys.clear()
 
     def _get_source_key(self) -> str:
         source_name = self.source_dd.get()
@@ -1360,11 +1405,44 @@ class App(ctk.CTk):
             except Exception:
                 messagebox.showinfo("Папка запуска", str(run_dir))
 
+    def _upsert_progress_line(self, key: str, text: str):
+        """
+        Показывает text как ОДНУ строку в логе для данного key — повторный
+        вызов с тем же key заменяет её содержимое на месте (через именованные
+        метки Tkinter Text), а не добавляет новую строку. Первый вызов для
+        нового key создаёт строку в конце лога и запоминает её границы.
+        """
+        start_mark, end_mark = f"prog_start_{key}", f"prog_end_{key}"
+        if key in self._progress_keys:
+            try:
+                start = self.log_text.index(start_mark)
+                end = self.log_text.index(end_mark)
+                self.log_text.delete(start, end)
+                self.log_text.insert(start, text, "progress")
+                self.log_text.mark_set(end_mark, f"{start}+{len(text)}c")
+                return
+            except tk.TclError:
+                # Метки потерялись (например, лог был очищен кнопкой
+                # "Очистить лог") — создаём строку заново, как для нового key.
+                self._progress_keys.discard(key)
+
+        self.log_text.insert("end", text + "\n", "progress")
+        end_index = self.log_text.index("end-1c")  # сразу перед добавленным \n
+        start_index = f"{end_index}-{len(text)}c"
+        self.log_text.mark_set(start_mark, start_index)
+        self.log_text.mark_set(end_mark, end_index)
+        self.log_text.mark_gravity(start_mark, "left")
+        self._progress_keys.add(key)
+
     def _poll_logs(self):
         try:
             while True:
                 msg = self.log_q.get_nowait()
-                if any(msg.startswith(p) for p in ("✓", "✅")):
+                progress = _parse_progress_line(msg)
+                if progress is not None:
+                    key, text = progress
+                    self._upsert_progress_line(key, text)
+                elif any(msg.startswith(p) for p in ("✓", "✅")):
                     self.log_text.insert("end", msg + "\n", "success")
                 elif any(msg.startswith(p) for p in ("✗", "❌", "ОШИБКА")):
                     self.log_text.insert("end", msg + "\n", "error")
@@ -2443,5 +2521,6 @@ if __name__ == "__main__":
     app.log_text.tag_config("success", foreground="#4CAF50")
     app.log_text.tag_config("error", foreground="#F44336")
     app.log_text.tag_config("stage", foreground="#2196F3")
+    app.log_text.tag_config("progress", foreground="#64B5F6")
 
     app.mainloop()
