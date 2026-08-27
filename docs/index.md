@@ -66,7 +66,10 @@ title: HelixFillDNA
 </style>
 
 <div class="hero">
-  <h1>HelixFillDNA</h1>
+  <h1 style="display:flex; align-items:center; justify-content:center; gap:0.6rem;">
+    <img src="logo.png" alt="Логотип HelixFillDNA" style="height:1.2em; width:auto; vertical-align:middle;">
+    HelixFillDNA
+  </h1>
   <p class="tagline">
     Конвертирует сырые данные ДНК (FTDNA, MyHeritage или готовый VCF)
     в формат 23andMe — для импутации и последующей загрузки в Генотек.
