@@ -81,11 +81,33 @@ title: HelixFillDNA
   <p><small>Windows 10+, 64-бит. Установщик не требует прав администратора.</small></p>
 </div>
 
-<img src="main_page.jpg" alt="Главное окно, вкладка Подготовка" style="max-width:100%; border-radius:8px; margin:1.5rem 0;">
-<img src="main_page2.jpg" alt="Главное окно, второй вид" style="max-width:100%; border-radius:8px; margin:1.5rem 0;">
+<figure style="margin:1.5rem 0; text-align:center;">
+  <img src="main_page.jpg" alt="Вкладка Подготовка: выбор источника данных и референсной панели" style="max-width:100%; border-radius:8px;">
+  <figcaption style="color:#777; font-size:0.9rem; margin-top:0.4rem;">
+    Вкладка «Подготовка» — выбор источника данных (FTDNA/MyHeritage/VCF), референсной панели импутации и нужных файлов.
+  </figcaption>
+</figure>
 
-<img src="run_page.jpg" alt="Результат конвертации" style="max-width:100%; border-radius:8px; margin:1.5rem 0;">
-<img src="run_page2.jpg" alt="Результат конвертации, второй вид" style="max-width:100%; border-radius:8px; margin:1.5rem 0;">
+<figure style="margin:1.5rem 0; text-align:center;">
+  <img src="main_page2.jpg" alt="Вкладка Подготовка: параметры вывода и порог Rsq" style="max-width:100%; border-radius:8px;">
+  <figcaption style="color:#777; font-size:0.9rem; margin-top:0.4rem;">
+    Там же — настройка формата вывода, порога качества импутации (Rsq) и параметров донорской панели.
+  </figcaption>
+</figure>
+
+<figure style="margin:1.5rem 0; text-align:center;">
+  <img src="run_page.jpg" alt="Вкладка Запуск: история запусков и старт этапов 1-6" style="max-width:100%; border-radius:8px;">
+  <figcaption style="color:#777; font-size:0.9rem; margin-top:0.4rem;">
+    Вкладка «Запуск» — история предыдущих запусков и кнопка запуска этапов 1-6 (подготовка файлов для загрузки на сервер импутации).
+  </figcaption>
+</figure>
+
+<figure style="margin:1.5rem 0; text-align:center;">
+  <img src="run_page2.jpg" alt="Этап 2: загрузка результатов Michigan Imputation Server" style="max-width:100%; border-radius:8px;">
+  <figcaption style="color:#777; font-size:0.9rem; margin-top:0.4rem;">
+    Этап 2 — вставьте curl-команду и пароль из письма Michigan Imputation Server, чтобы скачать результаты и собрать финальный файл.
+  </figcaption>
+</figure>
 
 ## Зачем это нужно
 
