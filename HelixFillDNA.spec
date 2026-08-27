@@ -113,16 +113,30 @@ coll = COLLECT(
     upx=False,
     upx_exclude=[],
     name="HelixFillDNA",
-    # ИСПРАВЛЕНИЕ БАГА "bcftools.exe не найден":
-    # начиная с PyInstaller 6.0 по умолчанию contents_directory="_internal" —
-    # все данные и бинарники (в т.ч. bin/bcftools.exe) кладутся в
-    # dist\HelixFillDNA\_internal\, а не плоско рядом с HelixFillDNA.exe.
-    # main.py::HtslibTools._find() и gui/app.py вычисляют bin_dir как папку
-    # РЯДОМ с exe (pre-6.0 layout), поэтому bcftools.exe не находился —
-    # bgzip/tabix "работали" только если случайно были в системном PATH.
-    # contents_directory="." возвращает старый плоский макет: bin/ снова
-    # лежит прямо в dist\HelixFillDNA\bin\, без правки Python-кода.
-    contents_directory=".",
+    # ИСПРАВЛЕНИЕ БАГА "ModuleNotFoundError: No module named 'customtkinter'"
+    # (v1.0.2): раньше здесь стоял contents_directory="." — идея была в том,
+    # чтобы вернуть старый плоский макет (bin/ рядом с exe, без _internal),
+    # так как main.py::HtslibTools._find() и gui/app.py::_detect_bin_dir()
+    # исторически ждали bin/ именно там.
+    #
+    # Но выяснилось (см. известный баг PyInstaller 6.x, issue #8075 в их
+    # трекере, закрыт мейнтейнерами как "won't fix"): файлы, добавленные
+    # через collect_all() — а именно так подключены customtkinter и
+    # pyfaidx выше в Analysis() — ФИЗИЧЕСКИ всё равно попадают в _internal,
+    # даже когда contents_directory="." просит плоский макет. При этом
+    # бутлоадер, ДОВЕРЯЯ contents_directory=".", настраивает sys.path БЕЗ
+    # папки _internal вообще (он не знает, что она нужна). В итоге
+    # customtkinter физически лежал в dist/HelixFillDNA/_internal/, но
+    # Python туда не заглядывал при импорте — отсюда и
+    # "ModuleNotFoundError: No module named 'customtkinter'" у конечных
+    # пользователей, никак не связанный с антивирусом/UPX (тот фикс в
+    # v1.0.1 был не по адресу, хоть и не вредный).
+    #
+    # Возвращаемся к ДЕФОЛТНОМУ макету с _internal — PyInstaller сам
+    # корректно прописывает эту папку в sys.path, поэтому импорт снова
+    # работает. gui/app.py::_detect_bin_dir() уже и так проверяет ОБА
+    # варианта расположения bin/ (плоский и _internal/bin) — переход
+    # обратно на _internal ничего не ломает в поиске bcftools/tabix/bgzip.
 )
 
 # ---------------------------------------------------------------------------
