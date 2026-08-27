@@ -18,7 +18,16 @@
 ; ============================================================================
 
 #define MyAppName "HelixFillDNA"
-#define MyAppVersion "1.0.0"
+; ИСПРАВЛЕНИЕ БАГА "релиз без установщика" (v1.0.1): раньше здесь было
+; безусловное #define MyAppVersion "1.0.0", которое ВСЕГДА перезаписывало
+; значение, переданное из CI через /DMyAppVersion=... — ISCC применяет /D
+; ДО обработки самого скрипта, поэтому обычный #define ниже просто затирал
+; его обратно на "1.0.0". #ifndef оставляет /D-значение в приоритете и
+; использует "1.0.0" только как запасной вариант при ручной сборке
+; двойным кликом (когда /D никто не передавал).
+#ifndef MyAppVersion
+  #define MyAppVersion "1.0.0"
+#endif
 #define MyAppPublisher "HelixFillDNA"
 #define MyAppExeName "HelixFillDNA.exe"
 ; Путь к папке, которую собрал PyInstaller (dist\HelixFillDNA рядом с этим .iss)
