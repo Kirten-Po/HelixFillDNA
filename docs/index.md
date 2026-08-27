@@ -78,13 +78,11 @@ title: HelixFillDNA
   <p><small>Windows 10+, 64-бит. Установщик не требует прав администратора.</small></p>
 </div>
 
-<div class="screenshot-placeholder">
-  [Скриншот — TODO: главное окно, вкладка «⚙️ Подготовка»]
-</div>
+<img src="main_page.jpg" alt="Главное окно, вкладка Подготовка" style="max-width:100%; border-radius:8px; margin:1.5rem 0;">
+<img src="main_page2.jpg" alt="Главное окно, второй вид" style="max-width:100%; border-radius:8px; margin:1.5rem 0;">
 
-<div class="screenshot-placeholder">
-  [Скриншот — TODO: результат конвертации / готовый файл для Генотека]
-</div>
+<img src="run_page.jpg" alt="Результат конвертации" style="max-width:100%; border-radius:8px; margin:1.5rem 0;">
+<img src="run_page2.jpg" alt="Результат конвертации, второй вид" style="max-width:100%; border-radius:8px; margin:1.5rem 0;">
 
 ## Зачем это нужно
 
