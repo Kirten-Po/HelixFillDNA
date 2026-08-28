@@ -1,4 +1,4 @@
-; ============================================================================
+﻿; ============================================================================
 ; HelixFillDNA.iss — скрипт Inno Setup для сборки Setup.exe.
 ;
 ; Как использовать (без командной строки):
@@ -78,6 +78,17 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs 
 ; иконку, зашитую PyInstaller'ом (см. icon= в .spec), но отдельный файл
 ; тоже кладём в {app}, чтобы IconFilename в [Icons] ниже мог на него сослаться.
 Source: "app_icon.ico"; DestDir: "{app}"; Flags: ignoreversion
+; Промт "обычные / продвинутые настройки": трафареты для сборки итогового
+; файла. В обычном режиме приложение подставляет их само по выбранному
+; источнику данных (FTDNA -> template_v3.txt, MyHeritage -> template_v5.txt),
+; поэтому после установки они должны лежать в {app}\samples — берём их из
+; папки samples\ рядом с этим .iss, а не из dist\ (PyInstaller кладёт свои
+; datas то плоско, то в _internal\, и полагаться на это нельзя).
+; skipifsourcedoesntexist: если трафарета нет у сборщика, установщик всё
+; равно соберётся, а приложение покажет подсказку, куда положить файл.
+Source: "samples\template_v3.txt"; DestDir: "{app}\samples"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "samples\template_v5.txt"; DestDir: "{app}\samples"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "samples\README.txt"; DestDir: "{app}\samples"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app_icon.ico"
@@ -96,3 +107,6 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}
 ; Type: filesandordirs; Name: "{app}\donors"
 ; Type: filesandordirs; Name: "{app}\output"
 ; Type: filesandordirs; Name: "{app}\reference"
+; Маленький файл с состоянием интерфейса (выбранный режим настроек
+; "Обычные"/"Продвинутые") — создаётся программой, при удалении не нужен.
+Type: files; Name: "{app}\ui_state.json"

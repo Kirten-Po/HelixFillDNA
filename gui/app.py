@@ -81,6 +81,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import logging
 import os
 import pickle
@@ -90,12 +91,14 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import traceback
 import webbrowser
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
+from urllib.parse import quote
 
 import customtkinter as ctk
 
@@ -103,6 +106,11 @@ import customtkinter as ctk
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 os.chdir(PROJECT_ROOT)
+
+# Версия приложения — из version.py в корне проекта (см. его докстринг:
+# та же строка сверяется с git-тегом при сборке релиза). Импорт возможен
+# только ПОСЛЕ sys.path.insert() выше.
+from version import __version__
 
 # === Фикс "--- Logging error ---" / AttributeError: 'NoneType' object has
 # no attribute 'write' в windowed-сборке PyInstaller (console=False) ===
@@ -191,6 +199,348 @@ def _detect_bin_dir() -> Path:
     if (internal_bin / exe_name).is_file():
         return internal_bin
     return flat_bin
+
+
+def _find_app_icon() -> Path | None:
+    """
+    Путь к app_icon.ico для иконки окна (та, что слева от заголовка и на
+    панели задач). Ищем в тех же двух местах, что и bin/ и samples/ —
+    PyInstaller кладёт файлы либо плоско рядом с exe, либо в _internal/,
+    а установщик Inno Setup кладёт иконку в {app} (см. [Files] в
+    HelixFillDNA.iss). None, если файла нет — окно просто останется с
+    иконкой Tk по умолчанию, падать из-за этого приложение не должно.
+    """
+    for candidate in (
+        PROJECT_ROOT / "app_icon.ico",
+        PROJECT_ROOT / "_internal" / "app_icon.ico",
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Промт "обычные / продвинутые настройки".
+#
+# Вкладка "Подготовка" исторически показывала СРАЗУ все параметры пайплайна
+# (формат вывода, порог Rsq, нормализация multiallelic, число EUR-доноров,
+# кэш сырых хромосом, путь к трафарету и к бинарникам htslib). Для человека,
+# который просто хочет "дополнить свой FTDNA-файл", это стена настроек, где
+# каждая ошибка стоит часов перекачки доноров.
+#
+# Поэтому у вкладки теперь два режима:
+#   * MODE_SIMPLE   — видны только источник данных, референсная панель и файл
+#                     с данными. Всё остальное выставляется автоматически
+#                     (см. _apply_simple_presets()), включая трафарет, который
+#                     берётся из папки samples/ рядом с программой.
+#   * MODE_ADVANCED — прежнее поведение, все настройки видны и правятся руками.
+#
+# Обычный режим НЕ подменяет значения "на лету" в момент запуска: он
+# физически проставляет их в те же самые виджеты, что и раньше. Поэтому весь
+# код запуска (_get_format_key(), _get_rsq_threshold(), _get_eur_sample_count()
+# и т.д.) читает настройки ровно как прежде и ничего не знает о режимах, а
+# пользователь, переключившись в продвинутый режим, видит именно то, что
+# будет использовано.
+# ---------------------------------------------------------------------------
+# Подписи подвкладок на вкладке "Запуск". Нумерация — не этапы пайплайна
+# (их 7), а то, что видит пользователь: подготовка файлов, ручная работа на
+# сайте MIS, сборка итогового файла. Базовые имена без галочки; актуальные
+# (с "✓" у пройденных) живут в App._run_tab_names, см. _set_wizard_step().
+RUN_TAB_BASE_NAMES = (
+    "1 · Подготовка файлов",
+    "2 · Импутация на MIS",
+    "3 · Сборка файла",
+)
+
+# Сколько ячеек хромосом в ряду карты этапа 3.
+DONOR_GRID_COLUMNS = 4
+
+# Идентификатор задания в письме MIS (job-20260828-123456 / -1). Нужен
+# только для дружелюбного "✓ Распознано задание ..." — на работу
+# скачивания не влияет, поэтому несовпадение не считается ошибкой.
+_MIS_JOB_RE = re.compile(r"job-\d{8}-\d{6}(?:-\d+)?", re.IGNORECASE)
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Человеческая длительность: «меньше минуты», «12 мин», «1 ч 20 мин»."""
+    seconds = max(0.0, seconds)
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "меньше минуты"
+    if minutes < 60:
+        return f"{minutes} мин"
+    hours, rest = divmod(minutes, 60)
+    return f"{hours} ч {rest:02d} мин" if rest else f"{hours} ч"
+
+
+
+# ---------------------------------------------------------------------------
+# Промт "живая карта хромосом на этапе 3".
+#
+# Скачивание доноров идёт в несколько потоков и часами. Общий счётчик
+# «Обработано хромосом: 7/22» не отвечает на главный вопрос пользователя —
+# «оно вообще шевелится или зависло?». download_donors.py уже печатает
+# подробности по каждой хромосоме (скачивание с процентами, фильтрация,
+# индексация, ошибки), просто они тонули в потоке лога. Ниже — разбор этих
+# строк в состояние конкретной хромосомы для карты 22 ячеек на вкладке
+# "Запуск". Менять сам download_donors.py при этом не потребовалось.
+#
+# Ранг нужен из-за параллельности: строка «скачивание 41%» может прийти в
+# очередь ПОЗЖЕ, чем «готово» (её напечатал другой поток чуть раньше), и без
+# ранга ячейка откатывалась бы назад. Состояние может только расти.
+# ---------------------------------------------------------------------------
+_DONOR_RANK_START = 1
+_DONOR_RANK_DOWNLOAD = 2
+_DONOR_RANK_FILTER = 3
+_DONOR_RANK_DONE = 4
+_DONOR_RANK_FAILED = 5  # выше "готово": ошибку не должно перекрывать ничем
+
+_DONOR_CHR_RE = re.compile(r"chr(\d{1,2})\b", re.IGNORECASE)
+# Процент может быть дробным (curl --progress-bar печатает "30.7%"), и без
+# необязательной дробной части регэксп цеплялся бы за "7%" вместо "30%".
+_DONOR_PCT_RE = re.compile(r"(\d{1,3})(?:[.,]\d+)?\s*%")
+
+# Как часто опрашивать размеры файлов доноров на диске, мс.
+_DONOR_WATCH_INTERVAL_MS = 1500
+
+
+def _fmt_size(num_bytes: float) -> str:
+    """Размер/скорость по-человечески: «812 МБ», «1.2 ГБ», «340 КБ»."""
+    num_bytes = max(0.0, float(num_bytes))
+    for unit, limit in (("ГБ", 1024 ** 3), ("МБ", 1024 ** 2), ("КБ", 1024)):
+        if num_bytes >= limit:
+            value = num_bytes / limit
+            return f"{value:.1f} {unit}" if value < 10 else f"{value:.0f} {unit}"
+    return f"{num_bytes:.0f} Б"
+
+
+def _parse_donor_state(msg: str):
+    """
+    (номер_хромосомы, текст, цвет, ранг) для строки лога скачивания
+    доноров, либо None — если строка не про конкретную хромосому.
+    """
+    match = _DONOR_CHR_RE.search(msg)
+    if not match:
+        return None
+    try:
+        chrom = int(match.group(1))
+    except ValueError:
+        return None
+    if not 1 <= chrom <= 22:
+        return None
+
+    low = msg.lower()
+
+    if msg.lstrip().startswith(("✗", "❌")) or "не удалось" in low or "ошибка" in low:
+        return chrom, "✗ ошибка", "#F44336", _DONOR_RANK_FAILED
+
+    if "уже готов" in low or "отфильтров" in low or "проверено" in low:
+        return chrom, "✓ готово", "#4CAF50", _DONOR_RANK_DONE
+
+    if "ALL.chr" in msg:
+        pct = _DONOR_PCT_RE.search(msg)
+        if pct:
+            return (chrom, f"⬇ скачивание {pct.group(1)}%", "#42A5F5",
+                    _DONOR_RANK_DOWNLOAD)
+        if "индекс" in low:
+            return chrom, "⬇ индекс", "#42A5F5", _DONOR_RANK_DOWNLOAD
+
+    if "подвыборк" in low or "chrom донора" in low or "фильтр" in low:
+        return chrom, "⚙ фильтрация", "#F9A825", _DONOR_RANK_FILTER
+
+    if "---" in msg:
+        kind = "удалённо" if "удалённо" in low else "начата"
+        return chrom, f"… {kind}", "gray70", _DONOR_RANK_START
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Промт "итоговый файл в отдельной папке".
+#
+# Раньше собранный файл ложился прямо в output/runs/<запуск>/, вперемешку с
+# десятками промежуточных VCF, логов и служебных json — найти его там было
+# отдельной задачей. Теперь итоговые файлы ВСЕХ запусков складываются в одну
+# папку results/ рядом с программой, а имя файла начинается с названия
+# запуска, чтобы они не путались между собой.
+# ---------------------------------------------------------------------------
+RESULTS_DIR_NAME = "results"
+
+
+# ---------------------------------------------------------------------------
+# Промт "обратная связь автору".
+#
+# Адрес получателя. ЕДИНСТВЕННОЕ место, где он задан, — меняется здесь.
+#
+# Программа не отправляет письмо сама, а открывает почтовый клиент
+# пользователя заготовленным mailto:. Это сознательный отказ от варианта
+# "приложение шлёт письмо через SMTP": логин и пароль от ящика пришлось бы
+# положить внутрь распространяемого exe, откуда их извлекает кто угодно за
+# пять минут — и рассылает с этого ящика спам, пока его не заблокируют.
+# Вариант со сторонним сервисом форм (Formspree и т.п.) такой проблемы не
+# создаёт, но требует аккаунта сервиса и делает отправку невидимой для
+# пользователя. Через mailto пользователь видит письмо целиком и жмёт
+# "Отправить" сам.
+# ---------------------------------------------------------------------------
+FEEDBACK_EMAIL = "kirten-tempest2026@outlook.com"
+FEEDBACK_SUBJECT_PREFIX = "HelixFillDNA"
+FEEDBACK_KINDS = ("Ошибка", "Предложение")
+FEEDBACK_LOG_LINES = 40
+
+# Windows передаёт mailto: через командную строку, где длина ограничена, и
+# слишком длинное письмо может обрезаться на полуслове. Считать надо длину
+# ГОТОВОЙ ссылки, а не текста: при percent-кодировании одна кириллическая
+# буква превращается в девять символов (%D0%9E).
+#
+# Порог подобран по реальным замерам, а не «на глаз» — первая версия с
+# лимитом 1900 срабатывала ВСЕГДА, даже на пустом письме, и пользователь
+# получал «текст не поместился», ничего не написав:
+#   пустое описание + техданные          -> ссылка ~2300
+#   описание на 500 знаков + техданные   -> ссылка ~5000
+#   то же плюс 40 строк лога             -> ссылка ~12900
+# 7000 пропускает обычное письмо с содержательным описанием и отправляет
+# в файл только то, что действительно огромно, — прежде всего лог.
+FEEDBACK_MAILTO_URL_LIMIT = 7000
+
+
+def _results_dir() -> Path:
+    """Папка с итоговыми файлами; создаётся при первом обращении."""
+    target = PROJECT_ROOT / RESULTS_DIR_NAME
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return target
+
+
+def _unique_result_path(path: Path) -> Path:
+    """
+    Путь, который точно не затрёт уже существующий файл: к имени
+    добавляется _2, _3 и т.д. Повторная сборка того же запуска (например с
+    другим порогом Rsq) не должна молча уничтожать предыдущий результат.
+    """
+    if not path.exists():
+        return path
+    stem, suffix = path.stem, path.suffix
+    n = 2
+    while True:
+        candidate = path.with_name(f"{stem}_{n}{suffix}")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+# Число этапов, которые выполняет кнопка "Запустить этапы 1-6 (до MIS)" —
+# делитель шкалы прогресса на вкладке "Запуск".
+STAGES_TOTAL = 6
+
+MODE_SIMPLE = "Обычные настройки"
+MODE_ADVANCED = "Продвинутые настройки"
+
+# Источник данных -> формат вывода в обычном режиме. FTDNA Family Finder
+# исторически соответствует трафарету v3 (LF), MyHeritage — v5 (CRLF).
+# Готовый VCF не привязан ни к одному из экспортов, поэтому для него берём
+# v3 как более полный по call rate.
+SIMPLE_FORMAT_BY_SOURCE = {"ftdna": "v3", "myheritage": "v5", "vcf": "v3"}
+SIMPLE_RSQ = "0.30"          # стандартный порог MIS
+SIMPLE_EUR_COUNT = 20        # компромисс трафик/качество для обычного режима
+SIMPLE_NORMALIZE = True      # нормализовать multiallelic-сайты перед split
+SIMPLE_RAW_CACHE = True      # хранить сырые хромосомы 1000 Genomes
+
+# Имена трафаретов в папке samples/ — по одному на формат вывода.
+SAMPLE_TEMPLATE_NAMES = {"v3": "template_v3.txt", "v5": "template_v5.txt"}
+
+# Выбранный режим переживает перезапуск программы: маленький JSON рядом с
+# exe, а не реестр/AppData — программа и так держит свои данные (donors/,
+# output/, reference/) в своей папке.
+UI_STATE_FILE = PROJECT_ROOT / "ui_state.json"
+
+SAMPLES_README = """Папка samples — трафареты для сборки итогового файла.
+
+Положите сюда файлы:
+    template_v3.txt  — трафарет для источника FTDNA Family Finder (формат v3, LF)
+    template_v5.txt  — трафарет для источника MyHeritage (формат v5, CRLF)
+
+Трафарет — это реальный экспорт 23andMe соответствующей версии: программа
+берёт из него порядок и набор rsid/позиций, а генотипы подставляет ваши.
+
+В режиме "Обычные настройки" программа сама подставляет нужный трафарет из
+этой папки по выбранному источнику данных, поэтому выбирать файл вручную не
+нужно. В режиме "Продвинутые настройки" путь к трафарету по-прежнему можно
+указать вручную кнопкой "Обзор".
+"""
+
+
+def _samples_candidates() -> list[Path]:
+    """
+    Возможные расположения папки samples/ — тот же приём, что и в
+    _detect_bin_dir(): PyInstaller в зависимости от версии кладёт datas либо
+    плоско рядом с exe, либо в _internal/.
+    """
+    return [PROJECT_ROOT / "samples", PROJECT_ROOT / "_internal" / "samples"]
+
+
+def _samples_dir() -> Path:
+    """
+    Папка с трафаретами. Если её нет ни в одном из ожидаемых мест —
+    создаёт PROJECT_ROOT/samples и кладёт туда README с инструкцией, куда
+    какой трафарет положить (в установщик трафареты входят, но при запуске
+    из исходников или после ручного удаления папки её нужно воссоздать).
+    Ошибки создания (запуск из read-only каталога) намеренно проглатываются:
+    отсутствие папки не должно мешать продвинутому режиму, где путь к
+    трафарету указывается вручную.
+    """
+    for candidate in _samples_candidates():
+        if candidate.is_dir():
+            return candidate
+    target = PROJECT_ROOT / "samples"
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        readme = target / "README.txt"
+        if not readme.exists():
+            readme.write_text(SAMPLES_README, encoding="utf-8")
+    except OSError:
+        pass
+    return target
+
+
+def _find_sample_template(fmt: str) -> Path | None:
+    """Путь к трафарету samples/template_<fmt>.txt или None, если его нет."""
+    name = SAMPLE_TEMPLATE_NAMES.get(fmt)
+    if not name:
+        return None
+    for base in _samples_candidates():
+        candidate = base / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _load_ui_mode() -> str:
+    """Режим вкладки "Подготовка" из прошлого запуска (по умолчанию — обычный)."""
+    try:
+        data = json.loads(UI_STATE_FILE.read_text(encoding="utf-8"))
+        mode = data.get("settings_mode")
+    except (OSError, ValueError):
+        return MODE_SIMPLE
+    return mode if mode in (MODE_SIMPLE, MODE_ADVANCED) else MODE_SIMPLE
+
+
+def _save_ui_mode(mode: str) -> None:
+    """Сохраняет выбранный режим. Не критично: ошибки записи игнорируются."""
+    try:
+        data = {}
+        if UI_STATE_FILE.is_file():
+            with contextlib.suppress(ValueError):
+                data = json.loads(UI_STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+        data["settings_mode"] = mode
+        UI_STATE_FILE.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
 
 
 # === Импорты пайплайна ===
@@ -437,30 +787,73 @@ def _do_select_all(widget):
             pass
 
 
-def attach_hotkeys(widget):
-    """
-    Привязывает Ctrl+C/V/X/A к виджету.
+# ---------------------------------------------------------------------------
+# Промт "горячие клавиши работают не до конца".
+#
+# Раньше Ctrl+C/V/X/A привязывались как <Control-c>, <Control-v> и т.д. На
+# Windows Tk подставляет в event.keysym символ ТЕКУЩЕЙ раскладки: при
+# русской раскладке нажатие физической клавиши C даёт keysym "es" (или
+# Cyrillic_es), а не "c" — событие <Control-c> просто не срабатывает, и
+# копирование/вставка «не работали», причём молча и через раз (в
+# английской раскладке всё было в порядке, поэтому баг выглядел
+# плавающим). Вариант с перечислением кириллических keysym'ов пришлось бы
+# расширять под каждую новую раскладку пользователя.
+#
+# Решение — одна привязка <Control-KeyPress> и разбор по event.keycode,
+# то есть по ФИЗИЧЕСКОЙ клавише (на Windows это VK-код: C=67, V=86, X=88,
+# A=65), не зависящей от раскладки вообще. На не-Windows keycode другой,
+# поэтому там остаётся разбор по keysym — в Linux/macOS сборках этой
+# программы всё равно нет, но и ломать их незачем.
+#
+# Дополнительно поддержаны классические Windows-сочетания Ctrl+Insert /
+# Shift+Insert / Shift+Delete: их ждут пользователи старой школы, а стоят
+# они три строки.
+#
+# Каждый обработчик возвращает "break": без этого Tk после нашего кода
+# прогоняет ещё и встроенный биндинг того же события — текст вставлялся
+# дважды, а Ctrl+A в поле ввода вместо выделения прыгал курсором в начало
+# строки (стандартное emacs-поведение tk.Entry).
+# ---------------------------------------------------------------------------
+_WIN_VK_ACTIONS = {67: "copy", 86: "paste", 88: "cut", 65: "select_all"}
+_KEYSYM_ACTIONS = {"c": "copy", "v": "paste", "x": "cut", "a": "select_all"}
 
-    Задача 1: каждый обработчик возвращает "break". Без этого Tk/CustomTkinter
-    сначала выполняет наш обработчик (который сам вставляет/копирует текст),
-    а затем ЕЩЁ РАЗ прогоняет встроенный биндинг того же события — в
-    результате текст вставлялся дважды. "break" останавливает дальнейшую
-    обработку события этим виджетом, поэтому срабатывает только наш код.
-    """
-    def _bind(seq, action_fn):
-        def handler(event, w=widget, fn=action_fn):
-            fn(w)
+
+def _hotkey_action_name(event) -> str | None:
+    """Какое действие запрошено сочетанием с Ctrl — независимо от раскладки."""
+    if os.name == "nt":
+        name = _WIN_VK_ACTIONS.get(getattr(event, "keycode", None))
+        if name is not None:
+            return name
+    return _KEYSYM_ACTIONS.get((getattr(event, "keysym", "") or "").lower())
+
+
+def attach_hotkeys(widget):
+    """Привязывает Ctrl+C/V/X/A (и Ctrl+Insert/Shift+Insert/Shift+Delete)."""
+    actions = {
+        "copy": _do_copy,
+        "paste": _do_paste,
+        "cut": _do_cut,
+        "select_all": _do_select_all,
+    }
+
+    def on_ctrl_key(event, w=widget):
+        name = _hotkey_action_name(event)
+        if name is None:
+            return None  # прочие сочетания с Ctrl отдаём Tk как есть
+        actions[name](w)
+        return "break"
+
+    widget.bind("<Control-KeyPress>", on_ctrl_key, add="+")
+
+    def _bind_simple(seq, fn):
+        def handler(event, w=widget, f=fn):
+            f(w)
             return "break"
         widget.bind(seq, handler, add="+")
 
-    _bind("<Control-c>", _do_copy)
-    _bind("<Control-C>", _do_copy)
-    _bind("<Control-v>", _do_paste)
-    _bind("<Control-V>", _do_paste)
-    _bind("<Control-x>", _do_cut)
-    _bind("<Control-X>", _do_cut)
-    _bind("<Control-a>", _do_select_all)
-    _bind("<Control-A>", _do_select_all)
+    _bind_simple("<Control-Insert>", _do_copy)
+    _bind_simple("<Shift-Insert>", _do_paste)
+    _bind_simple("<Shift-Delete>", _do_cut)
 
 
 def attach_context_menu(widget):
@@ -482,7 +875,10 @@ def attach_context_menu(widget):
             menu.grab_release()
 
     widget.bind("<Button-3>", show_menu, add="+")
-    widget.bind("<App>", show_menu, add="+")
+    if os.name == "nt":
+        # <App> — клавиша "контекстное меню" рядом с правым Ctrl. Такого
+        # keysym нет в X11-сборках Tk, там bind() на него бросает TclError.
+        widget.bind("<App>", show_menu, add="+")
     return menu
 
 
@@ -496,14 +892,54 @@ def attach_input_features(widget):
 # ---------------------------------------------------------------------------
 class App(ctk.CTk):
     def __init__(self):
-        super().__init__()
-
-        self.title("HelixFillDNA")
-        self.geometry("1000x750")
-        self.minsize(850, 650)
-
+        # ВАЖЕН ПОРЯДОК: тему ставим ДО создания окна.
+        #
+        # ctk.set_appearance_mode() на Windows перекрашивает заголовок окна
+        # через DwmSetWindowAttribute, а чтобы новый цвет отрисовался,
+        # customtkinter прячет и заново показывает окно (withdraw + update,
+        # см. CTk._windows_set_titlebar_color). Этот приём сбрасывает
+        # состояние "развёрнуто на весь экран" обратно в обычное окно —
+        # именно поэтому раньше приложение на мгновение открывалось во весь
+        # экран и тут же схлопывалось до 1000x750. Пока окна ещё нет,
+        # перекрашивать нечего, и никакого withdraw не происходит.
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
+
+        super().__init__()
+
+        self.title(f"HelixFillDNA  v{__version__}")
+
+        # Иконка окна (слева от заголовка и на панели задач) вместо
+        # стандартной заглушки Tk. iconbitmap() применяется дважды
+        # намеренно: customtkinter внутри пересоздаёт часть оформления
+        # окна уже после __init__, и на некоторых версиях Windows/Tk
+        # первый вызов при этом теряется — повторный через after()
+        # ставит иконку окончательно. Оба вызова защищены: отсутствие
+        # или повреждение .ico не должно мешать запуску приложения.
+        self._apply_window_icon()
+        self.after(200, self._apply_window_icon)
+        # Стартовый размер сразу задаём по экрану, а не 1000x750: иначе на
+        # системах, где state("zoomed") срабатывает не мгновенно (или не
+        # срабатывает вовсе), пользователь успевает увидеть, как маленькое
+        # окно прыгает в полный экран. Минус в том, что «свернуть в окно»
+        # вернёт почти тот же размер — это меньшее зло, чем прыжок при
+        # каждом запуске.
+        try:
+            self.geometry(
+                f"{self.winfo_screenwidth()}x{max(400, self.winfo_screenheight() - 70)}+0+0"
+            )
+        except tk.TclError:
+            self.geometry("1000x750")
+        self.minsize(850, 650)
+        # Открываемся развёрнутыми на весь экран: на вкладке "Запуск" три
+        # шага, шкала прогресса и карта из 22 хромосом — в окне 1000x750
+        # это сплошная прокрутка.
+        #
+        # after(0) — а не прямой вызов: customtkinter при первом показе
+        # окна ещё раз прячет и показывает его (CTk.mainloop() -> withdraw
+        # + deiconify), и разворот, сделанный до этого, потерялся бы.
+        # Обработчик after выполняется уже после этой процедуры.
+        self.after(0, self._maximize_window)
 
         self.log_q: queue.Queue = queue.Queue()
         self.running = False
@@ -527,6 +963,47 @@ class App(ctk.CTk):
         # создана обновляемая строка прогресса (см. _upsert_progress_line).
         self._progress_keys: set[str] = set()
 
+        # Промт "сделать вкладку Запуск юзерфрендли": состояние мастера.
+        # _run_started_at — момент старта длинной операции (time.monotonic),
+        # по нему считается оценка оставшегося времени под шкалой; None,
+        # когда ничего не выполняется.
+        self._wizard_step = 1
+        self._run_started_at: float | None = None
+        self._run_details_visible = False
+        # Карта состояний донорских хромосом этапа 3: {номер: (ранг, текст)}.
+        self._donor_states: dict[int, tuple[int, str]] = {}
+        # Наблюдение за папками доноров: какие папки опрашивать, последние
+        # увиденные размеры файлов и id запланированного after()-вызова.
+        self._donor_watch_dirs: list[Path] = []
+        # Что именно сейчас наблюдаем: "donors" (этап 3 Шага 1) или "mis"
+        # (скачивание результатов на Шаге 3). От этого зависит, в какую
+        # панель писать — сам механизм опроса общий.
+        self._watch_target = "donors"
+        self._donor_file_sizes: dict[Path, tuple[float, int]] = {}
+        self._donor_watch_id = None
+        # Путь к последнему собранному итоговому файлу (в results/).
+        self._last_result_path: Path | None = None
+
+        # Промт "обычные / продвинутые настройки": папка с трафаретами
+        # создаётся программой сама при первом запуске, чтобы в обычном
+        # режиме было куда класть template_v3.txt / template_v5.txt.
+        _samples_dir()
+        _results_dir()
+
+        # Нижняя полоска: версия слева, обратная связь справа. Пакуется
+        # ДО tabview и с side="bottom" — иначе tabview с expand=True забрал
+        # бы всё место и полоску прижало бы в ноль.
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.pack(side="bottom", fill="x", padx=12, pady=(0, 8))
+        ctk.CTkLabel(
+            footer, text=f"HelixFillDNA v{__version__}", text_color="gray50",
+        ).pack(side="left")
+        ctk.CTkButton(
+            footer, text="✉ Сообщить об ошибке / предложить улучшение", width=340,
+            fg_color="transparent", border_width=1,
+            command=self._open_feedback_dialog,
+        ).pack(side="right")
+
         self.tabview = ctk.CTkTabview(self)
         self.tabview.pack(fill="both", expand=True, padx=10, pady=10)
 
@@ -543,46 +1020,137 @@ class App(ctk.CTk):
     # -----------------------------------------------------------------------
     # Вкладка "Подготовка"
     # -----------------------------------------------------------------------
+    def _maximize_window(self):
+        """
+        Разворачивает окно на весь экран. state("zoomed") работает на
+        Windows и macOS; в X11-сборках Tk такого состояния нет — там
+        отдельный атрибут "-zoomed", а если и его нет (некоторые оконные
+        менеджеры), просто растягиваем окно по размеру экрана. Любая
+        неудача не должна мешать запуску: окно останется 1000x750.
+        """
+        self.after(300, self._verify_maximized)
+        try:
+            self.state("zoomed")
+            return
+        except tk.TclError:
+            pass
+        try:
+            self.attributes("-zoomed", True)
+            return
+        except tk.TclError:
+            pass
+        self._stretch_to_screen()
+
+    def _stretch_to_screen(self):
+        try:
+            self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
+        except tk.TclError:
+            pass
+
+    def _verify_maximized(self):
+        """
+        state("zoomed") и атрибут "-zoomed" не бросают ошибку, когда просто
+        ничего не делают (например, оконный менеджер их не поддерживает) —
+        поэтому недостаточно вызвать их и понадеяться. Через треть секунды
+        после старта смотрим на фактический размер окна и, если оно так и
+        осталось маленьким, растягиваем его руками.
+        """
+        try:
+            too_narrow = self.winfo_width() < self.winfo_screenwidth() * 0.9
+            too_short = self.winfo_height() < self.winfo_screenheight() * 0.8
+        except tk.TclError:
+            return
+        if too_narrow or too_short:
+            self._stretch_to_screen()
+
+    def _apply_window_icon(self):
+        """Ставит app_icon.ico на окно. Молча ничего не делает, если файла
+        нет или Tk отказался его читать (не-Windows платформа, битый .ico)."""
+        icon = _find_app_icon()
+        if icon is None:
+            return
+        try:
+            self.iconbitmap(str(icon))
+        except tk.TclError:
+            pass
+
     def _build_settings_tab(self):
         scroll = ctk.CTkScrollableFrame(self.tab_settings)
         scroll.pack(fill="both", expand=True, padx=10, pady=10)
 
+        # --- Промт "обычные / продвинутые настройки": переключатель ------
         ctk.CTkLabel(
             scroll, text="Основные настройки",
             font=ctk.CTkFont(size=20, weight="bold"),
-        ).pack(anchor="w", pady=(0, 10))
+        ).pack(anchor="w", pady=(0, 8))
+        self.mode_switch = ctk.CTkSegmentedButton(
+            scroll, values=[MODE_SIMPLE, MODE_ADVANCED],
+            command=self._on_mode_changed, width=340,
+        )
+        self.mode_switch.set(_load_ui_mode())
+        self.mode_switch.pack(anchor="w", pady=(0, 15))
 
-        ctk.CTkLabel(scroll, text="Источник данных:").pack(anchor="w")
+        # ==================================================================
+        # Базовый блок — виден в ОБОИХ режимах.
+        # ==================================================================
+        base = ctk.CTkFrame(scroll, fg_color="transparent")
+        base.pack(fill="x")
+        self.basic_box = base
+
+        ctk.CTkLabel(base, text="Источник данных:").pack(anchor="w")
         source_names = [v["name"] for v in pipeline.SOURCES.values()]
-        self.source_dd = ctk.CTkOptionMenu(scroll, values=source_names, width=400)
+        self.source_dd = ctk.CTkOptionMenu(
+            base, values=source_names, width=400,
+            command=lambda _choice: self._on_source_changed(),
+        )
         self.source_dd.set(source_names[0])
         self.source_dd.pack(anchor="w", pady=(0, 15))
 
-        # --- Шаг 1 промта "HRC / TopMed": выбор референсной панели -------
-        ctk.CTkLabel(scroll, text="Референсная панель импутации:").pack(anchor="w")
-        panel_names = [v["display_name"] for v in pipeline.REFERENCE_PANELS.values()]
-        self.panel_dd = ctk.CTkOptionMenu(
-            scroll, values=panel_names, width=400,
-            command=lambda _choice: self._on_panel_changed(),
-        )
-        self.panel_dd.set(pipeline.REFERENCE_PANELS[pipeline.DEFAULT_PANEL]["display_name"])
-        self.panel_dd.pack(anchor="w", pady=(0, 5))
-
-        self.panel_warning_lbl = ctk.CTkLabel(
-            scroll, text="", justify="left", text_color="#F9A825", wraplength=700,
-        )
-        self.panel_warning_lbl.pack(anchor="w", pady=(0, 15))
-
-        ctk.CTkLabel(scroll, text="Файл с данными:").pack(anchor="w")
-        row1 = ctk.CTkFrame(scroll, fg_color="transparent")
+        ctk.CTkLabel(base, text="Файл с данными:").pack(anchor="w")
+        row1 = ctk.CTkFrame(base, fg_color="transparent")
         row1.pack(fill="x", pady=(0, 15))
         self.input_tf = ctk.CTkEntry(row1, placeholder_text="Выберите файл...", width=600)
         self.input_tf.pack(side="left", fill="x", expand=True, padx=(0, 10))
         ctk.CTkButton(row1, text="Обзор", width=100,
                       command=lambda: self._pick_file(self.input_tf)).pack(side="right")
 
+        # Сводка того, что обычный режим выбрал за пользователя. Пакуется
+        # и распаковывается в _on_mode_changed() вместе с self.adv_box.
+        self.simple_info_lbl = ctk.CTkLabel(
+            base, text="", justify="left", text_color="gray60", wraplength=700,
+        )
+        self.simple_tmpl_lbl = ctk.CTkLabel(
+            base, text="", justify="left", text_color="#4CAF50", wraplength=700,
+        )
+
+        # ==================================================================
+        # Продвинутый блок — скрывается целиком в обычном режиме.
+        # ==================================================================
+        adv = ctk.CTkFrame(scroll, fg_color="transparent")
+        adv.pack(fill="x")
+        self.adv_box = adv
+
+        # --- Шаг 1 промта "HRC / TopMed": выбор референсной панели -------
+        # В обычном режиме панель не показывается и всегда берётся
+        # pipeline.DEFAULT_PANEL (HRC): смена панели тянет за собой другую
+        # сборку генома, отдельный референс, отдельный кэш доноров и
+        # лифтовер координат — это осознанный выбор, а не рутинная настройка.
+        ctk.CTkLabel(adv, text="Референсная панель импутации:").pack(anchor="w")
+        panel_names = [v["display_name"] for v in pipeline.REFERENCE_PANELS.values()]
+        self.panel_dd = ctk.CTkOptionMenu(
+            adv, values=panel_names, width=400,
+            command=lambda _choice: self._on_panel_changed(),
+        )
+        self.panel_dd.set(pipeline.REFERENCE_PANELS[pipeline.DEFAULT_PANEL]["display_name"])
+        self.panel_dd.pack(anchor="w", pady=(0, 5))
+
+        self.panel_warning_lbl = ctk.CTkLabel(
+            adv, text="", justify="left", text_color="#F9A825", wraplength=700,
+        )
+        self.panel_warning_lbl.pack(anchor="w", pady=(0, 15))
+
         ctk.CTkLabel(
-            scroll,
+            adv,
             text=("ℹ Референсный геном для FTDNA/MyHeritage проверяется\n"
                   "автоматически при запуске под выбранную выше панель. Если\n"
                   "файла нет в reference/<панель>/ — он будет скачан и распакован\n"
@@ -590,16 +1158,20 @@ class App(ctk.CTk):
             justify="left", text_color="gray60",
         ).pack(anchor="w", pady=(0, 15))
 
-        ctk.CTkLabel(scroll, text="Трафарет (template_v3.txt):").pack(anchor="w")
-        row3 = ctk.CTkFrame(scroll, fg_color="transparent")
+        ctk.CTkLabel(
+            adv,
+            text=("Трафарет (по умолчанию берётся из samples/, здесь можно "
+                  "указать свой файл):"),
+        ).pack(anchor="w")
+        row3 = ctk.CTkFrame(adv, fg_color="transparent")
         row3.pack(fill="x", pady=(0, 15))
         self.tmpl_tf = ctk.CTkEntry(row3, placeholder_text="Выберите файл...", width=600)
         self.tmpl_tf.pack(side="left", fill="x", expand=True, padx=(0, 10))
         ctk.CTkButton(row3, text="Обзор", width=100,
                       command=lambda: self._pick_file(self.tmpl_tf)).pack(side="right")
 
-        ctk.CTkLabel(scroll, text="Папка с бинарниками htslib:").pack(anchor="w")
-        row_bin = ctk.CTkFrame(scroll, fg_color="transparent")
+        ctk.CTkLabel(adv, text="Папка с бинарниками htslib:").pack(anchor="w")
+        row_bin = ctk.CTkFrame(adv, fg_color="transparent")
         row_bin.pack(fill="x", pady=(0, 5))
         self.bin_tf = ctk.CTkEntry(row_bin, width=600)
         self.bin_tf.insert(0, str(_detect_bin_dir()))
@@ -609,7 +1181,7 @@ class App(ctk.CTk):
             command=self._on_diagnose_network,
         ).pack(side="right")
         ctk.CTkLabel(
-            scroll,
+            adv,
             text=("ℹ Проверяет CA-сертификаты для libcurl (bcftools) и наличие "
                   "конфликтующего curl.exe в папке бинарников — нужно только "
                   "для ускоренного удалённого скачивания доноров (Этап 3), "
@@ -618,16 +1190,16 @@ class App(ctk.CTk):
             justify="left", text_color="gray60", wraplength=700,
         ).pack(anchor="w", pady=(0, 15))
 
-        ctk.CTkFrame(scroll, height=2, fg_color="gray40").pack(fill="x", pady=15)
+        ctk.CTkFrame(adv, height=2, fg_color="gray40").pack(fill="x", pady=15)
 
         ctk.CTkLabel(
-            scroll, text="Параметры вывода",
+            adv, text="Параметры вывода",
             font=ctk.CTkFont(size=20, weight="bold"),
         ).pack(anchor="w", pady=(0, 10))
 
-        ctk.CTkLabel(scroll, text="Формат вывода:").pack(anchor="w")
+        ctk.CTkLabel(adv, text="Формат вывода:").pack(anchor="w")
         self.format_dd = ctk.CTkOptionMenu(
-            scroll,
+            adv,
             values=["v3 (LF, ~97% call rate)", "v5 (CRLF, ~92% call rate)"],
             width=400,
         )
@@ -635,7 +1207,7 @@ class App(ctk.CTk):
         self.format_dd.pack(anchor="w", pady=(0, 15))
 
         ctk.CTkLabel(
-            scroll, text="Порог Rsq (качество импутации, от 0 до 1):",
+            adv, text="Порог Rsq (качество импутации, от 0 до 1):",
             font=ctk.CTkFont(weight="bold"),
         ).pack(anchor="w")
         rsq_info = (
@@ -645,11 +1217,11 @@ class App(ctk.CTk):
             "0.90 — только высокоточные варианты (меньше позиций, но надёжнее).\n"
             "0.95+ — максимальное качество для критичных задач."
         )
-        ctk.CTkLabel(scroll, text=rsq_info, justify="left", text_color="gray60").pack(
+        ctk.CTkLabel(adv, text=rsq_info, justify="left", text_color="gray60").pack(
             anchor="w", pady=(4, 8)
         )
 
-        row_rsq = ctk.CTkFrame(scroll, fg_color="transparent")
+        row_rsq = ctk.CTkFrame(adv, fg_color="transparent")
         row_rsq.pack(fill="x", pady=(0, 5))
         ctk.CTkLabel(row_rsq, text="Значение:").pack(side="left", padx=(0, 10))
         self.rsq_entry = ctk.CTkEntry(row_rsq, width=100, placeholder_text="0.30")
@@ -658,17 +1230,18 @@ class App(ctk.CTk):
         self.rsq_entry.bind("<KeyRelease>", lambda e: self._validate_rsq_entry())
 
         self.rsq_status_lbl = ctk.CTkLabel(
-            scroll, text="✓ Порог принят: 0.30", text_color="#4CAF50",
+            adv, text="✓ Порог принят: 0.30", text_color="#4CAF50",
         )
         self.rsq_status_lbl.pack(anchor="w", pady=(0, 15))
 
         # Задача C: опциональная нормализация multiallelic-сайтов
         # (bcftools norm -m-both). НЕ входит в критический путь фикса
         # Invalid alleles (это делают Задачи A/B) — отдельная оптимизация,
-        # поэтому выключена по умолчанию, как и в CLI (--normalize).
+        # поэтому выключена по умолчанию в продвинутом режиме, как и в CLI
+        # (--normalize); обычный режим включает её сам.
         self.normalize_var = ctk.BooleanVar(value=False)
         self.normalize_cb = ctk.CTkCheckBox(
-            scroll,
+            adv,
             text="Нормализовать multiallelic-сайты перед split (bcftools norm -m-both, опционально)",
             variable=self.normalize_var,
         )
@@ -678,14 +1251,14 @@ class App(ctk.CTk):
         # людьми на одном чипе (широкая сигнатура вместо строгой).
         self.reuse_donors_var = ctk.BooleanVar(value=False)
         self.reuse_donors_cb = ctk.CTkCheckBox(
-            scroll,
+            adv,
             text=("Переиспользовать доноров между разными людьми на одном чипе "
                   "(экспериментально, Задача D)"),
             variable=self.reuse_donors_var,
         )
         self.reuse_donors_cb.pack(anchor="w", pady=(0, 5))
         ctk.CTkLabel(
-            scroll,
+            adv,
             text=("ℹ Строит сигнатуру чипа по всем измеренным позициям вместо позиций, "
                   "прошедших личный QC. Позволяет не перекачивать ~22 файла доноров "
                   "для каждого нового человека на том же чипе. Требует пересборки "
@@ -700,14 +1273,13 @@ class App(ctk.CTk):
         # случайной выборке многие сайты, полиморфные в популяции в целом,
         # случайно оказываются мономорфными во всех 20 взятых образцах —
         # MIS отбрасывает такие сайты из QC ("Monomorphic sites"), снижая
-        # итоговое покрытие. По умолчанию теперь используется ВСЯ доступная
-        # EUR-подвыборка панели (обычно порядка 500 человек) — это честное
-        # увеличение размера случайной выборки, а не подбор конкретных
-        # образцов под конкретные позиции чипа (такой алгоритмический
-        # "умный" подбор сознательно не реализован — см. пояснения в чате).
+        # итоговое покрытие. По умолчанию в продвинутом режиме используется
+        # ВСЯ доступная EUR-подвыборка панели (обычно порядка 500 человек);
+        # обычный режим сознательно берёт 20 — ради разумного трафика и
+        # времени первого запуска.
         self.eur_all_var = ctk.BooleanVar(value=True)
         self.eur_all_cb = ctk.CTkCheckBox(
-            scroll,
+            adv,
             text=("Использовать всех доступных EUR-доноров 1000 Genomes "
                   "(уменьшает Monomorphic sites на QC MIS, но увеличивает "
                   "трафик/время скачивания доноров)"),
@@ -716,7 +1288,7 @@ class App(ctk.CTk):
         )
         self.eur_all_cb.pack(anchor="w", pady=(0, 5))
 
-        row_eur_count = ctk.CTkFrame(scroll, fg_color="transparent")
+        row_eur_count = ctk.CTkFrame(adv, fg_color="transparent")
         row_eur_count.pack(fill="x", pady=(0, 5))
         ctk.CTkLabel(row_eur_count, text="Или конкретное число доноров:").pack(
             side="left", padx=(0, 10)
@@ -730,12 +1302,12 @@ class App(ctk.CTk):
         attach_input_features(self.eur_count_entry)
 
         self.eur_count_status_lbl = ctk.CTkLabel(
-            scroll, text="✓ Будут использованы все доступные EUR-доноры (~500)",
+            adv, text="✓ Будут использованы все доступные EUR-доноры (~500)",
             text_color="#4CAF50",
         )
         self.eur_count_status_lbl.pack(anchor="w", pady=(0, 5))
         ctk.CTkLabel(
-            scroll,
+            adv,
             text=("ℹ По умолчанию (галочка включена) используются ВСЕ EUR-образцы "
                   "из панели 1000 Genomes — это снижает долю Monomorphic sites, "
                   "которые MIS исключает из QC на маленькой (20 образцов) случайной "
@@ -752,10 +1324,11 @@ class App(ctk.CTk):
         # хромосом 1000 Genomes, переиспользуемый МЕЖДУ ВСЕМИ источниками
         # (ftdna/myheritage/vcf) и чипами ОДНОЙ референсной сборки —
         # экономит трафик при повторных запусках/переключении источника
-        # ценой постоянного места на диске. По умолчанию выключен.
+        # ценой постоянного места на диске. По умолчанию выключен в
+        # продвинутом режиме; обычный режим включает его.
         self.raw_cache_var = ctk.BooleanVar(value=False)
         self.raw_cache_cb = ctk.CTkCheckBox(
-            scroll,
+            adv,
             text=("Хранить сырые (нефильтрованные) хромосомы 1000 Genomes для "
                   "повторного использования между разными источниками/чипами "
                   "(~десятки ГБ на диске, экономит трафик при последующих запусках)"),
@@ -763,7 +1336,7 @@ class App(ctk.CTk):
         )
         self.raw_cache_cb.pack(anchor="w", pady=(0, 5))
         ctk.CTkLabel(
-            scroll,
+            adv,
             text=("ℹ Доноры каждого источника/чипа всё равно хранятся отдельно "
                   "(donors/<source>/<panel>/) — этот кэш касается только ПОЛНЫХ, "
                   "ещё не отфильтрованных хромосом 1000 Genomes "
@@ -781,79 +1354,152 @@ class App(ctk.CTk):
 
         # Первичная синхронизация предупреждения под панель по умолчанию.
         self._on_panel_changed()
+        # Применяем режим, восстановленный из ui_state.json: в обычном
+        # режиме это скроет self.adv_box и проставит автоматические
+        # значения (в том числе трафарет из samples/).
+        self._on_mode_changed(self.mode_switch.get())
 
     # -----------------------------------------------------------------------
     # Вкладка "Запуск"
     # -----------------------------------------------------------------------
     def _build_run_tab(self):
-        scroll = ctk.CTkScrollableFrame(self.tab_run)
-        scroll.pack(fill="both", expand=True, padx=10, pady=10)
+        # ==================================================================
+        # Вкладка "Запуск" — три подвкладки по числу шагов.
+        #
+        # Раньше всё содержимое трёх шагов лежало одним длинным скроллом, и
+        # пользователь одновременно видел кнопку запуска подготовки, поля
+        # для письма MIS и инструкцию для сайта — хотя в каждый момент
+        # времени осмысленно ровно одно из трёх. Теперь каждый шаг живёт в
+        # своей подвкладке, а программа сама переключает её по мере
+        # выполнения (_set_wizard_step). Переключиться руками тоже можно —
+        # посмотреть вперёд или вернуться никто не мешает.
+        #
+        # Общее для всех шагов (выбор запуска и шкала прогресса) остаётся
+        # НАД подвкладками: прогресс должен быть виден, на какой бы шаг ни
+        # переключился пользователь.
+        # ==================================================================
+        header = ctk.CTkFrame(self.tab_run, fg_color="transparent")
+        header.pack(fill="x", padx=10, pady=(10, 0))
 
-        # --- Промт "Именованные папки запуска": имя/история запусков ------
-        ctk.CTkLabel(
-            scroll, text="Запуск (папка результатов)",
-            font=ctk.CTkFont(size=20, weight="bold"),
-        ).pack(anchor="w", pady=(0, 10))
+        run_row = ctk.CTkFrame(header, fg_color="transparent")
+        run_row.pack(fill="x", pady=(0, 5))
+        ctk.CTkLabel(run_row, text="Запуск:").pack(side="left", padx=(0, 10))
+        self.run_history_dd = ctk.CTkOptionMenu(run_row, values=["(нет запусков)"], width=340)
+        self.run_history_dd.pack(side="left", padx=(0, 10))
+        ctk.CTkButton(
+            run_row, text="＋ Новый", width=105, command=self._on_new_run,
+        ).pack(side="left", padx=(0, 5))
+        ctk.CTkButton(
+            run_row, text="📂 Папка запуска", width=150, command=self._on_open_run_folder,
+        ).pack(side="left", padx=(0, 5))
+        self.run_details_btn = ctk.CTkButton(
+            run_row, text="▾ Подробнее", width=125,
+            fg_color="transparent", border_width=1,
+            command=self._toggle_run_details,
+        )
+        self.run_details_btn.pack(side="left")
 
-        ctk.CTkLabel(scroll, text="Название запуска:").pack(anchor="w")
-        run_name_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        self.active_run_lbl = ctk.CTkLabel(header, text="Активный запуск: нет", text_color="gray60")
+        self.active_run_lbl.pack(anchor="w", pady=(0, 5))
+
+        # --- Свёрнутые подробности запуска -------------------------------
+        self.run_details_box = ctk.CTkFrame(header, fg_color="transparent")
+        self._run_details_visible = False
+
+        ctk.CTkLabel(self.run_details_box, text="Название нового запуска:").pack(anchor="w")
+        run_name_row = ctk.CTkFrame(self.run_details_box, fg_color="transparent")
         run_name_row.pack(fill="x", pady=(0, 5))
         self.run_name_tf = ctk.CTkEntry(run_name_row, width=200)
         self.run_name_tf.pack(side="left", padx=(0, 10))
         ctk.CTkButton(
-            run_name_row, text="Обновить историю", width=170,
+            run_name_row, text="▶ Продолжить (Шаг 3)", width=190,
+            command=self._on_continue_run,
+        ).pack(side="left", padx=(0, 5))
+        ctk.CTkButton(
+            run_name_row, text="✏ Переименовать", width=160,
+            command=self._on_rename_run,
+        ).pack(side="left", padx=(0, 5))
+        ctk.CTkButton(
+            run_name_row, text="⟳ Обновить историю", width=180,
             command=self._refresh_run_history,
         ).pack(side="left")
         attach_input_features(self.run_name_tf)
 
         ctk.CTkLabel(
-            scroll,
-            text=("ℹ Каждый запуск пишет файлы в свою папку "
-                  "output/runs/<название>/ — донор-кэш (donors/) общий "
-                  "для всех запусков и не дублируется. По умолчанию "
-                  "название — следующий свободный номер; можно ввести "
-                  "своё (например имя человека)."),
-            justify="left", text_color="gray60", wraplength=700,
-        ).pack(anchor="w", pady=(0, 10))
+            self.run_details_box,
+            text=("ℹ Каждый запуск пишет рабочие файлы в свою папку "
+                  "output/runs/<название>/ — донор-кэш (donors/) общий для "
+                  "всех запусков и не дублируется. Итоговый файл кладётся "
+                  f"отдельно, в папку {RESULTS_DIR_NAME}/ рядом с программой.\n"
+                  "«Продолжить» нужен, если письмо от MIS пришло уже после "
+                  "перезапуска программы: выберите свой запуск в списке "
+                  "выше и сделайте его активным, не прогоняя Шаг 1 заново."),
+            justify="left", text_color="gray60", wraplength=760,
+        ).pack(anchor="w", pady=(0, 5))
 
-        ctk.CTkLabel(scroll, text="История запусков:").pack(anchor="w")
-        history_row = ctk.CTkFrame(scroll, fg_color="transparent")
-        history_row.pack(fill="x", pady=(0, 5))
-        self.run_history_dd = ctk.CTkOptionMenu(history_row, values=["(нет запусков)"], width=420)
-        self.run_history_dd.pack(side="left", padx=(0, 10))
-        ctk.CTkButton(
-            history_row, text="Продолжить (Этап 2)", width=180,
-            command=self._on_continue_run,
-        ).pack(side="left", padx=(0, 5))
-        ctk.CTkButton(
-            history_row, text="Переименовать", width=140,
-            command=self._on_rename_run,
-        ).pack(side="left", padx=(0, 5))
-        ctk.CTkButton(
-            history_row, text="Открыть папку", width=140,
-            command=self._on_open_run_folder,
-        ).pack(side="left")
-
-        self.active_run_lbl = ctk.CTkLabel(scroll, text="Активный запуск: нет", text_color="gray60")
-        self.active_run_lbl.pack(anchor="w", pady=(0, 15))
-
-        ctk.CTkFrame(scroll, height=2, fg_color="gray40").pack(fill="x", pady=(0, 15))
-
-        ctk.CTkLabel(
-            scroll, text="Этап 1: Подготовка файлов для MIS",
-            font=ctk.CTkFont(size=20, weight="bold"),
-        ).pack(anchor="w", pady=(0, 10))
-
-        self.stage_lbl = ctk.CTkLabel(scroll, text="Готов к запуску",
+        # --- Общая шкала прогресса ---------------------------------------
+        self.stage_lbl = ctk.CTkLabel(header, text="Готов к запуску",
                                       font=ctk.CTkFont(size=16, weight="bold"))
-        self.stage_lbl.pack(anchor="w", pady=(0, 5))
+        self.stage_lbl.pack(anchor="w", pady=(8, 3))
 
-        self.progress = ctk.CTkProgressBar(scroll, height=15)
-        self.progress.pack(fill="x", pady=(0, 15))
+        self.progress = ctk.CTkProgressBar(header, height=15)
+        self.progress.pack(fill="x", pady=(0, 3))
         self.progress.set(0)
 
+        # Оценка времени: скачивание доноров идёт часами, и голая полоса
+        # без времени читается как "зависло".
+        self.eta_lbl = ctk.CTkLabel(header, text="", text_color="gray60")
+        self.eta_lbl.pack(anchor="w")
+
+        # Последняя строка лога прямо здесь — чтобы при ошибке не нужно
+        # было догадываться переключиться на вкладку "Лог".
+        log_peek_row = ctk.CTkFrame(header, fg_color="transparent")
+        log_peek_row.pack(fill="x", pady=(0, 5))
+        self.last_log_lbl = ctk.CTkLabel(
+            log_peek_row, text="", text_color="gray60", anchor="w", justify="left",
+        )
+        self.last_log_lbl.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkButton(
+            log_peek_row, text="Показать лог", width=130,
+            fg_color="transparent", border_width=1,
+            command=lambda: self.tabview.set("Лог"),
+        ).pack(side="right")
+
+        # --- Подвкладки шагов --------------------------------------------
+        self.run_tabs = ctk.CTkTabview(self.tab_run)
+        self.run_tabs.pack(fill="both", expand=True, padx=10, pady=(5, 10))
+        # Текущие подписи подвкладок: rename() меняет ключ, по которому
+        # работает .set(), поэтому актуальные имена держим здесь.
+        self._run_tab_names = list(RUN_TAB_BASE_NAMES)
+        for name in self._run_tab_names:
+            self.run_tabs.add(name)
+
+        self._build_step1_tab(self.run_tabs.tab(self._run_tab_names[0]))
+        self._build_step2_tab(self.run_tabs.tab(self._run_tab_names[1]))
+        self._build_step3_tab(self.run_tabs.tab(self._run_tab_names[2]))
+
+        self._refresh_run_instructions()
+        self._refresh_run_name_suggestion()
+        self._refresh_run_history()
+        self._set_wizard_step(1)
+        self._refresh_mis_btn_state()
+
+    # --- Шаг 1: подготовка файлов (этапы 1-6) ----------------------------
+    def _build_step1_tab(self, parent):
+        scroll = ctk.CTkScrollableFrame(parent)
+        scroll.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(
+            scroll,
+            text=("Программа прочитает ваш файл, скачает донорские хромосомы "
+                  "1000 Genomes и подготовит 22 файла для загрузки на сервер "
+                  "импутации. Самая долгая часть — скачивание доноров (этап 3), "
+                  "оно может идти несколько часов."),
+            justify="left", text_color="gray60", wraplength=760,
+        ).pack(anchor="w", pady=(0, 10))
+
         self.start_btn = ctk.CTkButton(
-            scroll, text="Запустить этапы 1-6 (до MIS)",
+            scroll, text="Запустить подготовку (этапы 1-6)",
             font=ctk.CTkFont(size=16, weight="bold"),
             fg_color="#2E7D32", hover_color="#1B5E20",
             height=50, corner_radius=12,
@@ -861,41 +1507,146 @@ class App(ctk.CTk):
         )
         self.start_btn.pack(fill="x", pady=(0, 10))
 
-        # Задача 1: активна только пока идёт скачивание доноров (Этап 3).
-        # Отмена реально прерывает текущий subprocess (curl) внутри
-        # download_donors.py, а не ждёт окончания текущей хромосомы.
+        # Кнопка остановки живёт в собственном контейнере: её пакуют и
+        # распаковывают (_show_cancel_donor_btn/_hide_cancel_donor_btn), а
+        # не просто гасят — неактивная красная кнопка, которая почти всё
+        # время бесполезна, только сбивала с толку. Реально прерывает
+        # текущий subprocess (curl), а не ждёт окончания хромосомы.
+        self.stop_box = ctk.CTkFrame(scroll, fg_color="transparent")
         self.cancel_donor_btn = ctk.CTkButton(
-            scroll, text="Отменить скачивание доноров", width=280,
+            self.stop_box, text="⏹ Остановить скачивание доноров",
             fg_color="#B71C1C", hover_color="#7F0000",
-            state="disabled",
             command=self._on_cancel_donor_download,
         )
-        self.cancel_donor_btn.pack(fill="x", pady=(0, 20))
+        self.cancel_donor_btn.pack(fill="x")
 
-        ctk.CTkFrame(scroll, height=2, fg_color="gray40").pack(fill="x", pady=15)
-
+        # --- Живая карта 22 хромосом (этап 3) ----------------------------
+        # Скачивание идёт в несколько потоков и часами; общий процент
+        # «Обработано хромосом: 7/22» не отвечает на вопрос «оно вообще
+        # шевелится?». Здесь по каждой хромосоме видно, что именно с ней
+        # происходит прямо сейчас: качается (с процентами), фильтруется,
+        # готова или упала. Панель появляется, только когда пошли
+        # сообщения про хромосомы, и прячется в начале нового запуска.
+        self.donor_panel = ctk.CTkFrame(scroll, border_width=1, border_color="gray40")
         ctk.CTkLabel(
-            scroll, text="Этап 2: Imputation на Michigan Server",
-            font=ctk.CTkFont(size=20, weight="bold"),
-        ).pack(anchor="w", pady=(0, 10))
+            self.donor_panel, text="Этап 3 · Донорские хромосомы 1000 Genomes",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).grid(row=0, column=0, columnspan=DONOR_GRID_COLUMNS, sticky="w",
+               padx=10, pady=(8, 6))
 
-        # Шаг 1 промта TopMed: текст инструкции про Reference Panel/Array
-        # Build теперь формируется динамически из выбранной на вкладке
-        # "Подготовка" панели (self.panel_dd), а не захардкожен под HRC —
-        # обновляется через _refresh_run_instructions(), вызываемую и при
-        # построении вкладки, и при смене self.panel_dd.
+        self.donor_chr_lbls: dict[int, ctk.CTkLabel] = {}
+        for chrom in range(1, 23):
+            idx = chrom - 1
+            row = 1 + idx // DONOR_GRID_COLUMNS
+            col = idx % DONOR_GRID_COLUMNS
+            lbl = ctk.CTkLabel(
+                self.donor_panel, text=f"chr{chrom} —", anchor="w",
+                text_color="gray50", width=150,
+            )
+            lbl.grid(row=row, column=col, sticky="w", padx=10, pady=2)
+            self.donor_chr_lbls[chrom] = lbl
+        for col in range(DONOR_GRID_COLUMNS):
+            self.donor_panel.grid_columnconfigure(col, weight=1)
+
+        base_row = 1 + (21 // DONOR_GRID_COLUMNS) + 1
+        # Что качается прямо сейчас: имя файла, сколько мегабайт уже на
+        # диске и с какой скоростью растёт. Заполняется _poll_donor_files().
+        self.donor_active_lbl = ctk.CTkLabel(
+            self.donor_panel, text="", text_color="#42A5F5", justify="left",
+        )
+        self.donor_active_lbl.grid(
+            row=base_row, column=0, columnspan=DONOR_GRID_COLUMNS,
+            sticky="w", padx=10, pady=(8, 2),
+        )
+
+        self.donor_summary_lbl = ctk.CTkLabel(
+            self.donor_panel, text="", text_color="gray60", justify="left",
+        )
+        self.donor_summary_lbl.grid(
+            row=base_row + 1, column=0,
+            columnspan=DONOR_GRID_COLUMNS, sticky="w", padx=10, pady=(2, 10),
+        )
+
+    # --- Шаг 2: ручная работа на сайте MIS -------------------------------
+    def _build_step2_tab(self, parent):
+        scroll = ctk.CTkScrollableFrame(parent)
+        scroll.pack(fill="both", expand=True)
+
+        # Текст держим коротким: кнопки под ним открывают сайт и папку, а
+        # значения формы вынесены в отдельный заметный блок ниже — в
+        # абзаце они терялись. Формируется динамически из выбранной
+        # панели (_refresh_run_instructions).
         self.run_instructions_lbl = ctk.CTkLabel(scroll, text="", justify="left")
         self.run_instructions_lbl.pack(anchor="w", pady=(0, 10))
 
+        mis_actions = ctk.CTkFrame(scroll, fg_color="transparent")
+        mis_actions.pack(fill="x", pady=(0, 5))
+        ctk.CTkButton(
+            mis_actions, text="🌐 Открыть сервер импутации", width=240,
+            command=self._on_open_mis_site,
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            mis_actions, text="📂 Папка с 22 файлами", width=210,
+            command=self._on_open_upload_folder,
+        ).pack(side="left")
+
+        self.mis_actions_status_lbl = ctk.CTkLabel(scroll, text="", text_color="gray60")
+        self.mis_actions_status_lbl.pack(anchor="w", pady=(0, 8))
+
+        # Параметры формы MIS отдельным заметным блоком: ошибиться здесь
+        # дорого (неверный Array Build — провал QC и потерянные часы).
+        # Кнопки "скопировать" тут нет намеренно: на сайте это выпадающие
+        # списки, вставлять в них нечего — значения нужно ВИДЕТЬ.
+        params_box = ctk.CTkFrame(scroll, border_width=1, border_color="#42A5F5")
+        params_box.pack(fill="x", pady=(0, 15))
+        ctk.CTkLabel(
+            params_box, text="Выберите в форме на сайте именно эти значения:",
+            text_color="gray70",
+        ).pack(anchor="w", padx=12, pady=(10, 4))
+        self.mis_params_lbl = ctk.CTkLabel(
+            params_box, text="", justify="left",
+            font=ctk.CTkFont(size=15, weight="bold"),
+        )
+        self.mis_params_lbl.pack(anchor="w", padx=12, pady=(0, 4))
+        ctk.CTkLabel(
+            params_box,
+            text="Остальные поля формы оставьте со значениями по умолчанию.",
+            text_color="gray60",
+        ).pack(anchor="w", padx=12, pady=(0, 10))
+
+        ctk.CTkLabel(
+            scroll,
+            text=("Когда сервер закончит импутацию, он пришлёт письмо со "
+                  "ссылкой и паролем — с ними переходите на Шаг 3. Программу "
+                  "можно закрыть и вернуться позже: выберите свой запуск в "
+                  "списке сверху и нажмите «▶ Продолжить (Шаг 3)» в подробностях."),
+            justify="left", text_color="gray60", wraplength=760,
+        ).pack(anchor="w")
+
+    # --- Шаг 3: скачивание результатов MIS и сборка (этап 7) -------------
+    def _build_step3_tab(self, parent):
+        scroll = ctk.CTkScrollableFrame(parent)
+        scroll.pack(fill="both", expand=True)
+
         ctk.CTkLabel(scroll, text="curl-команда из письма MIS:").pack(anchor="w")
         self.curl_tf = ctk.CTkTextbox(scroll, height=80, width=700)
-        self.curl_tf.pack(fill="x", pady=(0, 10))
+        self.curl_tf.pack(fill="x", pady=(0, 3))
+        self.curl_tf.bind("<KeyRelease>", lambda e: self._validate_curl_entry())
+        self.curl_tf.bind("<<Paste>>", lambda e: self.after(50, self._validate_curl_entry))
+        self.curl_tf.bind("<FocusOut>", lambda e: self._validate_curl_entry())
+
+        self.curl_status_lbl = ctk.CTkLabel(
+            scroll, text="", text_color="gray60", justify="left", wraplength=760,
+        )
+        self.curl_status_lbl.pack(anchor="w", pady=(0, 10))
 
         ctk.CTkLabel(scroll, text="Пароль из письма:").pack(anchor="w")
         pwd_row = ctk.CTkFrame(scroll, fg_color="transparent")
         pwd_row.pack(fill="x", pady=(0, 15))
         self.pwd_tf = ctk.CTkEntry(pwd_row, show="*", width=520, placeholder_text="Пароль")
         self.pwd_tf.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.pwd_tf.bind("<KeyRelease>", lambda e: self._refresh_mis_btn_state())
+        self.pwd_tf.bind("<<Paste>>", lambda e: self.after(50, self._refresh_mis_btn_state))
         self.show_pwd_btn = ctk.CTkButton(
             pwd_row, text="👁", width=50,
             command=self._toggle_pwd,
@@ -907,21 +1658,57 @@ class App(ctk.CTk):
         ).pack(side="right")
 
         self.mis_btn = ctk.CTkButton(
-            scroll, text="Скачать результаты и собрать финальный файл",
+            scroll, text="📥 Скачать результаты и собрать финальный файл",
             font=ctk.CTkFont(size=16, weight="bold"),
             fg_color="#1565C0", hover_color="#0D47A1",
             height=50, corner_radius=12,
             state="disabled",
             command=self._on_mis,
         )
-        self.mis_btn.pack(fill="x", pady=(0, 10))
+        self.mis_btn.pack(fill="x", pady=(0, 3))
+
+        # Почему кнопка серая — раньше это было неочевидно, и пользователь
+        # просто жал по ней впустую.
+        self.mis_hint_lbl = ctk.CTkLabel(
+            scroll, text="", text_color="gray60", justify="left", wraplength=760,
+        )
+        self.mis_hint_lbl.pack(anchor="w", pady=(0, 15))
+
+        # Что скачивается прямо сейчас. Скачивание результатов MIS — это
+        # десяток зашифрованных архивов на несколько гигабайт, и раньше на
+        # всё это время шкала стояла на нуле с подписью "Скачивание
+        # результатов MIS...", что неотличимо от зависания. Панель
+        # появляется на время скачивания и убирается после.
+        self.mis_files_box = ctk.CTkFrame(scroll, border_width=1, border_color="gray40")
+        ctk.CTkLabel(
+            self.mis_files_box, text="Скачивание результатов",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(10, 4))
+        self.mis_files_lbl = ctk.CTkLabel(
+            self.mis_files_box, text="", justify="left",
+            text_color="gray60", wraplength=740,
+        )
+        self.mis_files_lbl.pack(anchor="w", padx=12, pady=(0, 10))
+
+        result_box = ctk.CTkFrame(scroll, border_width=1, border_color="gray40")
+        result_box.pack(fill="x")
+        self.result_box = result_box
+        ctk.CTkLabel(
+            result_box, text="Итоговый файл",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(10, 4))
+        self.result_lbl = ctk.CTkLabel(
+            result_box, text="", justify="left", text_color="gray60", wraplength=740,
+        )
+        self.result_lbl.pack(anchor="w", padx=12, pady=(0, 8))
+        ctk.CTkButton(
+            result_box, text="📁 Открыть папку с итоговым файлом", width=320,
+            command=self._on_open_results_folder,
+        ).pack(anchor="w", padx=12, pady=(0, 12))
 
         attach_input_features(self.curl_tf)
         attach_input_features(self.pwd_tf)
-
-        self._refresh_run_instructions()
-        self._refresh_run_name_suggestion()
-        self._refresh_run_history()
+        self._refresh_result_label()
 
     # -----------------------------------------------------------------------
     # Вкладка "Лог"
@@ -958,6 +1745,125 @@ class App(ctk.CTk):
         if path:
             entry.delete(0, "end")
             entry.insert(0, path)
+
+    # -----------------------------------------------------------------------
+    # Промт "обычные / продвинутые настройки"
+    # -----------------------------------------------------------------------
+    def _is_simple_mode(self) -> bool:
+        return self.mode_switch.get() == MODE_SIMPLE
+
+    def _on_mode_changed(self, choice: str | None = None):
+        """
+        Переключение между обычным и продвинутым режимом вкладки
+        "Подготовка". Продвинутый блок (self.adv_box) не пересоздаётся, а
+        снимается/возвращается через pack_forget()/pack() — виджеты в нём
+        живы всегда, поэтому весь остальной код (валидация, чтение
+        значений при запуске) работает одинаково в обоих режимах.
+
+        pack() возвращает блок в конец self.adv_box'ового родителя
+        (scroll), а базовый блок и сводка лежат внутри self.basic_box,
+        который остаётся на месте — порядок элементов не нарушается.
+        """
+        simple = (choice or self.mode_switch.get()) == MODE_SIMPLE
+        if simple:
+            self.adv_box.pack_forget()
+            self.simple_info_lbl.pack(anchor="w", pady=(0, 4))
+            self.simple_tmpl_lbl.pack(anchor="w", pady=(0, 15))
+            self._apply_simple_presets()
+        else:
+            self.simple_info_lbl.pack_forget()
+            self.simple_tmpl_lbl.pack_forget()
+            self.adv_box.pack(fill="x")
+        _save_ui_mode(MODE_SIMPLE if simple else MODE_ADVANCED)
+
+    def _on_source_changed(self):
+        """
+        В обычном режиме источник данных — единственная настройка, от
+        которой зависят остальные (формат вывода и трафарет), поэтому при
+        его смене пресеты пересчитываются. В продвинутом режиме смена
+        источника ничего не трогает: там всё выбирает пользователь.
+        """
+        if self._is_simple_mode():
+            self._apply_simple_presets()
+
+    def _apply_simple_presets(self):
+        """
+        Проставляет в виджеты продвинутого блока значения, выбранные за
+        пользователя в обычном режиме:
+
+          * формат вывода   — по источнику (ftdna -> v3 LF, myheritage -> v5 CRLF);
+          * трафарет        — samples/template_v3.txt / template_v5.txt;
+          * порог Rsq       — 0.30 (стандартный порог MIS);
+          * нормализация multiallelic-сайтов перед split — включена;
+          * хранение сырых хромосом 1000 Genomes         — включено;
+          * "использовать всех доступных EUR-доноров"     — выключено,
+            вместо этого конкретное число доноров = 20.
+
+        Значения пишутся именно в виджеты (а не подставляются в момент
+        запуска), поэтому, переключившись в продвинутый режим, пользователь
+        видит ровно то, что будет использовано.
+        """
+        source = self._get_source_key()
+        fmt = SIMPLE_FORMAT_BY_SOURCE.get(source, "v3")
+
+        # Референсная панель в обычном режиме всегда HRC (DEFAULT_PANEL):
+        # это GRCh37, то есть та же сборка, в которой уже лежат координаты
+        # чипа — не нужен ни лифтовер, ни второй комплект референса/доноров.
+        panel_display = pipeline.REFERENCE_PANELS[pipeline.DEFAULT_PANEL]["display_name"]
+        if self.panel_dd.get() != panel_display:
+            self.panel_dd.set(panel_display)
+            self._on_panel_changed()
+
+        for value in self.format_dd.cget("values"):
+            if value.startswith(fmt):
+                self.format_dd.set(value)
+                break
+
+        self.rsq_entry.delete(0, "end")
+        self.rsq_entry.insert(0, SIMPLE_RSQ)
+        self._validate_rsq_entry()
+
+        self.normalize_var.set(SIMPLE_NORMALIZE)
+        self.raw_cache_var.set(SIMPLE_RAW_CACHE)
+
+        self.eur_all_var.set(False)
+        self.eur_count_entry.configure(state="normal")
+        self.eur_count_entry.delete(0, "end")
+        self.eur_count_entry.insert(0, str(SIMPLE_EUR_COUNT))
+        self._on_eur_all_toggled()
+
+        template = _find_sample_template(fmt)
+        if template is not None:
+            self.tmpl_tf.delete(0, "end")
+            self.tmpl_tf.insert(0, str(template))
+            self.simple_tmpl_lbl.configure(
+                text=f"✓ Трафарет подставлен автоматически: {template}",
+                text_color="#4CAF50",
+            )
+        else:
+            expected = _samples_dir() / SAMPLE_TEMPLATE_NAMES.get(fmt, "template_v3.txt")
+            self.simple_tmpl_lbl.configure(
+                text=(f"⚠ Трафарет не найден: положите файл в {expected} "
+                      f"— или переключитесь в продвинутый режим и укажите "
+                      f"путь вручную."),
+                text_color="#F9A825",
+            )
+
+        source_name = pipeline.SOURCES.get(source, {}).get("name", source)
+        self.simple_info_lbl.configure(
+            text=(
+                f"Настройки подобраны автоматически под источник «{source_name}»:\n"
+                f"    • референсная панель: {panel_display}\n"
+                f"    • формат вывода: {fmt} "
+                f"({'CRLF' if fmt == 'v5' else 'LF'})\n"
+                f"    • порог Rsq: {SIMPLE_RSQ}\n"
+                f"    • нормализация multiallelic-сайтов перед split: включена\n"
+                f"    • хранение сырых хромосом 1000 Genomes: включено\n"
+                f"    • число EUR-доноров: {SIMPLE_EUR_COUNT} "
+                f"(не «все доступные»)\n"
+                f"Чтобы изменить их вручную, выберите «{MODE_ADVANCED}» выше."
+            )
+        )
 
     def _validate_rsq_entry(self) -> bool:
         text = self.rsq_entry.get().strip()
@@ -1208,6 +2114,16 @@ class App(ctk.CTk):
                     f"референса/доноров)."
                 )
             )
+        # Пустое предупреждение всё равно занимало вертикальный отступ и
+        # оставляло дыру в макете — убираем метку с экрана, когда текста нет.
+        if self.panel_warning_lbl.cget("text"):
+            if not self.panel_warning_lbl.winfo_manager():
+                self.panel_warning_lbl.pack(
+                    anchor="w", pady=(0, 15), after=self.panel_dd,
+                )
+        else:
+            self.panel_warning_lbl.pack_forget()
+
         # Метод может вызываться до построения вкладки "Запуск" (первичная
         # синхронизация в конце _build_settings_tab) — тогда просто пропускаем.
         if hasattr(self, "run_instructions_lbl"):
@@ -1216,14 +2132,28 @@ class App(ctk.CTk):
     def _refresh_run_instructions(self):
         panel = self._get_panel_key()
         cfg = pipeline.REFERENCE_PANELS[panel]
-        text = (
-            "1. После завершения этапов 1-6 откроется папка с 22 файлами.\n"
-            f"2. Загрузите их на {cfg['mis_upload_url']}\n"
-            f"3. Reference Panel: {cfg['mis_panel_value']}, Population: EUR\n"
-            "4. Дождитесь письма со ссылкой и паролем, вставьте их ниже.\n"
-            "💡 Совет: Ctrl+V для вставки, правая кнопка мыши — контекстное меню"
-        )
-        self.run_instructions_lbl.configure(text=text)
+        build = "GRCh38/hg38" if cfg["genome_build"] == "grch38" else "GRCh37/hg19"
+        # Текст держим коротким: кнопки под ним открывают сайт и папку, а
+        # значения формы вынесены в отдельный заметный блок ниже — в
+        # абзаце они терялись.
+        self.run_instructions_lbl.configure(text=(
+            "Этот шаг делается руками на сайте импутации:\n"
+            "1. Откройте сайт и загрузите на него 22 файла из папки запуска "
+            "(обе кнопки ниже).\n"
+            "2. В форме выберите параметры из синей рамки.\n"
+            "3. Дождитесь письма со ссылкой и паролем и вставьте их в Шаге 3.\n"
+            "💡 Ctrl+V для вставки, правая кнопка мыши — контекстное меню"
+        ))
+
+        # Блок параметров создаётся позже самого первого вызова этого
+        # метода (панель синхронизируется ещё на вкладке "Подготовка") —
+        # поэтому проверяем наличие, как и с run_instructions_lbl выше.
+        if hasattr(self, "mis_params_lbl"):
+            self.mis_params_lbl.configure(text=(
+                f"Reference Panel:  {cfg['mis_panel_value']}\n"
+                f"Array Build:  {build}\n"
+                f"Population:  EUR"
+            ))
 
     # -----------------------------------------------------------------------
     # Промт "Именованные папки запуска": имя/история запусков
@@ -1308,7 +2238,7 @@ class App(ctk.CTk):
 
     def _on_continue_run(self):
         """
-        Кнопка «▶ Продолжить (Этап 2)» — делает выбранный из истории
+        Кнопка «▶ Продолжить (Шаг 3)» — делает выбранный из истории
         запуск активным без повторного прогона Этапов 1-6. Основной
         сценарий: пользователь получил письмо MIS уже после перезапуска
         GUI, и self.current_run_dir из предыдущей сессии потерян.
@@ -1329,7 +2259,8 @@ class App(ctk.CTk):
             ):
                 return
         self._set_active_run(run_dir, run_dir.name)
-        self.mis_btn.configure(state="normal")
+        self._set_wizard_step(2)
+        self._refresh_mis_btn_state()
         messagebox.showinfo(
             "Запуск выбран",
             f"Активный запуск: «{run_dir.name}».\n"
@@ -1391,19 +2322,771 @@ class App(ctk.CTk):
         messagebox.showinfo("Готово", f"Запуск переименован в «{new_name}»")
 
     def _on_open_run_folder(self):
-        """Кнопка «📂 Открыть папку» — открывает папку выбранного из
-        истории запуска в системном файловом менеджере."""
-        run_dir = self._selected_history_run()
+        """Кнопка «📂 Открыть папку» — открывает папку выбранного в списке
+        запуска, а если в списке ничего нет — папку активного запуска."""
+        run_dir = self._selected_history_run() or self.current_run_dir
         if run_dir is None:
-            messagebox.showwarning("Предупреждение", "Выберите запуск из списка истории")
+            messagebox.showwarning(
+                "Предупреждение",
+                "Пока нет ни одного запуска. Запустите Шаг 1 — папка "
+                "создастся автоматически.",
+            )
             return
-        if os.name == "nt":
-            os.startfile(str(run_dir))
+        self._open_in_file_manager(Path(run_dir))
+
+    # -----------------------------------------------------------------------
+    # Промт "сделать вкладку Запуск юзерфрендли"
+    # -----------------------------------------------------------------------
+    def _set_wizard_step(self, step: int):
+        """
+        Переключает подвкладку "Запуска" на нужный шаг и помечает
+        пройденные галочкой в самой подписи вкладки. step: 1 (подготовка),
+        2 (импутация на MIS), 3 (сборка файла).
+
+        CTkTabview.rename() меняет ключ, по которому работает .set(),
+        поэтому актуальные подписи держатся в self._run_tab_names — без
+        этого второй вызов .set() ушёл бы к несуществующему имени.
+        """
+        self._wizard_step = step
+        for i, base in enumerate(RUN_TAB_BASE_NAMES, start=1):
+            desired = f"✓ {base}" if i < step else base
+            current = self._run_tab_names[i - 1]
+            if current != desired:
+                self.run_tabs.rename(current, desired)
+                self._run_tab_names[i - 1] = desired
+        self.run_tabs.set(self._run_tab_names[step - 1])
+
+    def _toggle_run_details(self):
+        """Разворачивает/сворачивает блок подробностей о папке запуска."""
+        if self._run_details_visible:
+            self.run_details_box.pack_forget()
+            self.run_details_btn.configure(text="▾ Подробнее")
         else:
+            # Возвращаем блок на его место — сразу после active_run_lbl, а
+            # не в конец контейнера (pack по умолчанию добавляет в хвост).
+            self.run_details_box.pack(fill="x", after=self.active_run_lbl)
+            self.run_details_btn.configure(text="▴ Свернуть")
+        self._run_details_visible = not self._run_details_visible
+
+    def _show_run_details(self):
+        if not self._run_details_visible:
+            self._toggle_run_details()
+
+    def _on_new_run(self):
+        """
+        «＋ Новый»: предлагает следующее свободное имя запуска и
+        разворачивает подробности, чтобы имя можно было сразу поправить.
+        Саму папку не создаёт — это делает _on_start() при запуске Шага 1.
+        """
+        if self.running:
+            messagebox.showwarning(
+                "Предупреждение", "Дождитесь завершения текущего запуска",
+            )
+            return
+        self._refresh_run_name_suggestion()
+        self._show_run_details()
+        self._set_wizard_step(1)
+
+    def _current_upload_dir(self) -> Path | None:
+        """Папка с 22 файлами для загрузки на MIS у активного запуска."""
+        if self.current_run_dir is None:
+            return None
+        return self.current_run_dir / "upload"
+
+    def _on_open_upload_folder(self):
+        """
+        «📂 Папка с 22 файлами»: открывает output/runs/<запуск>/upload —
+        иначе пользователю приходится искать её в проводнике руками.
+        """
+        upload_dir = self._current_upload_dir()
+        if upload_dir is None:
+            messagebox.showinfo(
+                "Папка ещё не создана",
+                "Сначала выполните Шаг 1 (подготовку файлов) или выберите "
+                "готовый запуск в списке и нажмите «▶ Продолжить (Шаг 3)».",
+            )
+            return
+        if not upload_dir.is_dir():
+            messagebox.showinfo(
+                "Папка ещё не создана",
+                f"У запуска «{self.current_run_name}» ещё нет папки с файлами "
+                f"для загрузки:\n{upload_dir}\n\nОна появляется в конце Шага 1.",
+            )
+            return
+        self._open_in_file_manager(upload_dir)
+
+    def _on_open_results_folder(self):
+        """
+        «📁 Открыть папку с итоговым файлом» — открывает results/ рядом с
+        программой. Туда складываются ИТОГОВЫЕ файлы всех запусков, отдельно
+        от рабочих папок output/runs/<...>, где лежат десятки промежуточных
+        VCF и логов и где готовый файл терялся из виду.
+        """
+        self._open_in_file_manager(_results_dir())
+
+    def _refresh_result_label(self):
+        """Строка о том, где лежит итоговый файл (или где он появится)."""
+        if not hasattr(self, "result_lbl"):
+            return
+        if self._last_result_path is not None:
+            self.result_lbl.configure(
+                text=f"✓ Готов: {self._last_result_path}", text_color="#4CAF50",
+            )
+        else:
+            self.result_lbl.configure(
+                text=(f"Появится после сборки в папке {_results_dir()} — "
+                      f"туда складываются итоговые файлы всех запусков."),
+                text_color="gray60",
+            )
+
+    def _open_in_file_manager(self, path: Path):
+        """Открывает папку в проводнике; на не-Windows — xdg-open, а если и
+        его нет, просто показывает путь, чтобы его можно было скопировать."""
+        path = Path(path)
+        if os.name == "nt":
+            os.startfile(str(path))
+            return
+        try:
+            subprocess.run(["xdg-open", str(path)], check=False)
+        except Exception:
+            messagebox.showinfo("Папка", str(path))
+
+    def _on_open_mis_site(self):
+        """
+        «🌐 Открыть сервер импутации» — адрес берётся из конфигурации той
+        панели, которая выбрана на вкладке "Подготовка": TOPMed r3 живёт
+        не на Michigan, а на BioData Catalyst (см. REFERENCE_PANELS в
+        main.py), и открывать всегда Michigan было бы ошибкой.
+        """
+        cfg = pipeline.REFERENCE_PANELS[self._get_panel_key()]
+        webbrowser.open(cfg["mis_upload_url"])
+        self.mis_actions_status_lbl.configure(
+            text=f"Открыт {cfg['mis_upload_url']}", text_color="gray60",
+        )
+
+    # --- Наблюдение за файлами доноров на диске -------------------------
+    def _start_file_watch(self, dirs, target: str = "donors"):
+        """
+        Запускает опрос папок с качающимися файлами (раз в
+        _DONOR_WATCH_INTERVAL_MS). Вызывается дважды за прогон: перед
+        этапом 3 Шага 1 (донорские хромосомы, target="donors") и перед
+        скачиванием результатов MIS на Шаге 3 (target="mis").
+
+        Почему опрос диска, а не разбор вывода загрузчика: сколько именно
+        мегабайт скачано, надёжно знает только сам файл на диске. Вывод
+        зависит от того, каким инструментом идёт закачка (aria2c печатает
+        «1.0GiB/1.2GiB(83%)», curl --progress-bar — только полоску из
+        решёток с процентом, bcftools при удалённой фильтрации не печатает
+        прогресса вообще), от того, установлен ли aria2c у пользователя, и
+        от прореживания вывода по времени. Размер файла не зависит ни от
+        чего из этого и растёт всегда, когда закачка жива, — именно на
+        этот вопрос («оно шевелится или зависло?») пользователь и смотрит.
+        """
+        self._donor_watch_dirs = [Path(d) for d in dirs if d]
+        self._donor_file_sizes = {}
+        self._watch_target = target
+        if not self._donor_watch_dirs:
+            return
+        if target == "donors":
+            self._show_donor_panel()
+        else:
+            self.mis_files_box.pack(fill="x", pady=(0, 15), before=self.result_box)
+            self.mis_files_lbl.configure(
+                text="Жду начала скачивания...", text_color="gray60",
+            )
+            # На этом отрезке общий объём заранее неизвестен (сколько
+            # архивов пришлёт MIS и какого размера — видно только по факту),
+            # поэтому вместо застывшей на нуле шкалы честнее бегущая
+            # полоса: «работаю, но сколько осталось — не знаю». Точные
+            # цифры при этом идут строкой ниже, по файлам.
+            self.progress.configure(mode="indeterminate")
+            self.progress.start()
+        if self._donor_watch_id is None:
+            self._poll_watch_files()
+
+    def _stop_file_watch(self):
+        if self._watch_target == "mis":
             try:
-                subprocess.run(["xdg-open", str(run_dir)], check=False)
+                self.progress.stop()
+                self.progress.configure(mode="determinate")
+                self.progress.set(0)
             except Exception:
-                messagebox.showinfo("Папка запуска", str(run_dir))
+                pass
+        self._donor_watch_dirs = []
+        if self._donor_watch_id is not None:
+            try:
+                self.after_cancel(self._donor_watch_id)
+            except Exception:
+                pass
+            self._donor_watch_id = None
+        if hasattr(self, "donor_active_lbl"):
+            self.donor_active_lbl.configure(text="")
+
+    def _poll_watch_files(self):
+        """Один цикл опроса: обновляет ячейки растущих файлов и список
+        активных закачек. Перепланирует сам себя, пока идёт скачивание."""
+        self._donor_watch_id = None
+        if not self._donor_watch_dirs:
+            return
+
+        now = time.monotonic()
+        donors = self._watch_target == "donors"
+        active: list[tuple[str, int, float]] = []
+        total_files = 0
+        total_bytes = 0
+        for directory in self._donor_watch_dirs:
+            try:
+                entries = list(directory.iterdir())
+            except OSError:
+                continue
+            for path in entries:
+                # На Шаге 1 растут только VCF-файлы доноров; на Шаге 3
+                # приходят zip-архивы MIS и распакованное из них, поэтому
+                # там смотрим на всё подряд.
+                if donors and ".vcf" not in path.name:
+                    continue
+                try:
+                    if not path.is_file():
+                        continue
+                    size = path.stat().st_size
+                except OSError:
+                    continue
+                total_files += 1
+                total_bytes += size
+                previous = self._donor_file_sizes.get(path)
+                self._donor_file_sizes[path] = (now, size)
+                if previous is None:
+                    continue
+                prev_time, prev_size = previous
+                if size <= prev_size:
+                    continue
+                speed = (size - prev_size) / max(0.001, now - prev_time)
+                active.append((path.name, size, speed))
+
+                match = _DONOR_CHR_RE.search(path.name) if donors else None
+                if match:
+                    chrom = int(match.group(1))
+                    if 1 <= chrom <= 22:
+                        kind = "индекс" if path.name.endswith(".tbi") else "⬇"
+                        self._set_donor_cell(
+                            chrom,
+                            f"{kind} {_fmt_size(size)} ({_fmt_size(speed)}/с)",
+                            "#42A5F5", _DONOR_RANK_DOWNLOAD,
+                        )
+
+        target_lbl = self.donor_active_lbl if donors else self.mis_files_lbl
+        if active:
+            active.sort(key=lambda item: -item[1])
+            lines = [
+                f"⬇ {name} — скачано {_fmt_size(size)}, {_fmt_size(speed)}/с"
+                for name, size, speed in active[:4]
+            ]
+            if len(active) > 4:
+                lines.append(f"… и ещё {len(active) - 4} файл(ов)")
+            if not donors:
+                lines.append(
+                    f"Всего в папке результатов: {total_files} файл(ов), "
+                    f"{_fmt_size(total_bytes)}"
+                )
+            target_lbl.configure(text="\n".join(lines), text_color="#42A5F5")
+        elif donors:
+            # Пусто — не значит "зависло": между хромосомами идёт
+            # фильтрация bcftools, она диск почти не растит.
+            target_lbl.configure(
+                text="Сейчас ничего не скачивается — идёт фильтрация/индексация.",
+                text_color="gray60",
+            )
+        else:
+            target_lbl.configure(
+                text=(f"Сейчас ничего не скачивается — идёт распаковка или "
+                      f"проверка архивов.\nВсего в папке результатов: "
+                      f"{total_files} файл(ов), {_fmt_size(total_bytes)}"),
+                text_color="gray60",
+            )
+
+        self._donor_watch_id = self.after(
+            _DONOR_WATCH_INTERVAL_MS, self._poll_watch_files,
+        )
+
+    # --- Живая карта донорских хромосом (этап 3) -------------------------
+    def _reset_donor_panel(self):
+        """Сбрасывает карту хромосом и убирает её с экрана — вызывается в
+        начале нового запуска, чтобы не смешивать состояния разных прогонов."""
+        if not hasattr(self, "donor_chr_lbls"):
+            return
+        for chrom, lbl in self.donor_chr_lbls.items():
+            lbl.configure(text=f"chr{chrom} —", text_color="gray50")
+        self.donor_summary_lbl.configure(text="")
+        self.donor_active_lbl.configure(text="")
+        self.donor_panel.pack_forget()
+        self._donor_states = {}
+        self._donor_file_sizes = {}
+
+    def _update_donor_panel(self, msg: str):
+        """
+        Обновляет карту хромосом по строке лога скачивания доноров.
+        Разбор — в _parse_donor_state() (модульная функция, чтобы её было
+        видно и тестировать отдельно от виджетов).
+        """
+        parsed = _parse_donor_state(msg)
+        if parsed is None:
+            return
+        self._set_donor_cell(*parsed)
+
+    def _show_donor_panel(self):
+        if hasattr(self, "donor_panel") and not self.donor_panel.winfo_manager():
+            self.donor_panel.pack(fill="x", pady=(10, 0))
+
+    def _set_donor_cell(self, chrom: int, text: str, color: str, rank: int):
+        """
+        Ставит состояние одной хромосоме. Единая точка входа и для разбора
+        строк лога (_update_donor_panel), и для опроса файлов на диске
+        (_poll_donor_files) — счётчик готовых и показ панели считаются
+        в одном месте, а не дублируются.
+        """
+        lbl = self.donor_chr_lbls.get(chrom)
+        if lbl is None:
+            return
+
+        # Сообщения от параллельных потоков приходят вперемешку, и строка
+        # прогресса скачивания может прийти уже ПОСЛЕ "готово" (её напечатал
+        # другой поток чуть раньше). Ранг не даёт состоянию откатиться назад.
+        # Равные ранги разрешены: так обновляются мегабайты внутри закачки.
+        if self._donor_states.get(chrom, (0,))[0] > rank:
+            return
+        self._donor_states[chrom] = (rank, text)
+        lbl.configure(text=f"chr{chrom} {text}", text_color=color)
+        self._show_donor_panel()
+
+        # Строго == DONE: у ранга FAILED число больше (ошибку не должно
+        # перекрывать запоздалое "готово" от другого потока), но в счётчик
+        # готовых упавшая хромосома, разумеется, не входит.
+        done = sum(1 for r, _ in self._donor_states.values() if r == _DONOR_RANK_DONE)
+        failed = sum(1 for r, _ in self._donor_states.values() if r == _DONOR_RANK_FAILED)
+        summary = f"Готово {done} из 22"
+        if failed:
+            summary += f", с ошибкой {failed}"
+        self.donor_summary_lbl.configure(text=summary)
+
+    def _validate_curl_entry(self) -> bool:
+        """
+        Проверяет вставленную curl-команду сразу при вставке, а не при
+        нажатии кнопки — тот же приём, что и у порога Rsq на вкладке
+        "Подготовка". Возвращает True, если поле непустое (кнопку Шага 3
+        не блокируем по одной лишь эвристике: письма MIS со временем
+        меняют формат, и ложное срабатывание не должно останавливать
+        работу — непохожий текст только помечается предупреждением).
+        """
+        text = self.curl_tf.get("1.0", "end").strip()
+        if not text:
+            self.curl_status_lbl.configure(text="", text_color="gray60")
+            self._refresh_mis_btn_state()
+            return False
+
+        looks_like_curl = "curl" in text.lower() and "http" in text.lower()
+        job = _MIS_JOB_RE.search(text)
+        if looks_like_curl and job:
+            self.curl_status_lbl.configure(
+                text=f"✓ Распознано задание {job.group(0)}", text_color="#4CAF50",
+            )
+        elif looks_like_curl:
+            self.curl_status_lbl.configure(
+                text="✓ Похоже на curl-команду (идентификатор задания не "
+                     "распознан — это нормально, формат письма мог измениться)",
+                text_color="#4CAF50",
+            )
+        else:
+            self.curl_status_lbl.configure(
+                text="⚠ Не похоже на curl-команду из письма MIS. Нужна строка, "
+                     "которая начинается с «curl» и содержит ссылку — скопируйте "
+                     "её из письма целиком. Кнопку ниже это не блокирует.",
+                text_color="#F9A825",
+            )
+        self._refresh_mis_btn_state()
+        return True
+
+    def _refresh_mis_btn_state(self):
+        """
+        Единая точка правды о доступности кнопки Шага 3 и о том, ПОЧЕМУ она
+        серая. Раньше кнопка просто включалась после Шага 1, а недостающие
+        curl/пароль обнаруживались только по нажатию — во всплывающем окне.
+        """
+        if self.running:
+            self.mis_btn.configure(state="disabled")
+            self.mis_hint_lbl.configure(
+                text="Идёт выполнение — дождитесь завершения.", text_color="gray60",
+            )
+            return
+
+        missing: list[str] = []
+        if self.current_run_dir is None:
+            missing.append("выполнить Шаг 1 (или выбрать готовый запуск и нажать "
+                           "«▶ Продолжить (Шаг 3)» в подробностях)")
+        if not self.curl_tf.get("1.0", "end").strip():
+            missing.append("вставить curl-команду из письма MIS")
+        if not self.pwd_tf.get().strip():
+            missing.append("вставить пароль из письма")
+
+        if missing:
+            self.mis_btn.configure(state="disabled")
+            self.mis_hint_lbl.configure(
+                text="Кнопка станет активной, когда: " + "; ".join(missing) + ".",
+                text_color="gray60",
+            )
+        else:
+            self.mis_btn.configure(state="normal")
+            self.mis_hint_lbl.configure(
+                text="✓ Всё готово — можно скачивать результаты и собирать файл.",
+                text_color="#4CAF50",
+            )
+
+    def _update_eta(self, frac: float):
+        """
+        Оценка оставшегося времени по доле выполненного. Оценка грубая
+        (этапы очень разные по длительности: скачивание доноров занимает
+        часы, разбивка по хромосомам — минуты), поэтому в тексте стоит
+        "примерно" и точное время не обещается. До 3% прогресса вообще
+        ничего не показываем — там оценка бессмысленна.
+        """
+        if self._run_started_at is None or frac < 0.03:
+            self.eta_lbl.configure(text="")
+            return
+        elapsed = time.monotonic() - self._run_started_at
+        remaining = elapsed * (1.0 - frac) / frac
+        self.eta_lbl.configure(
+            text=f"Прошло {_fmt_duration(elapsed)} · осталось примерно "
+                 f"{_fmt_duration(remaining)}"
+        )
+
+    def _notify_done(self, success: bool):
+        """
+        Звук + мигание кнопки в панели задач по окончании длинной операции:
+        Шаг 1 идёт часами, и к экрану в этот момент обычно никто не сидит.
+        """
+        try:
+            self.bell()
+        except Exception:
+            pass
+        self._flash_taskbar()
+        if success:
+            self.eta_lbl.configure(text="Готово.", text_color="#4CAF50")
+        else:
+            self.eta_lbl.configure(text="Завершено с ошибкой — см. лог.",
+                                   text_color="#F44336")
+
+    def _flash_taskbar(self):
+        """
+        Мигание кнопки приложения в панели задач Windows (FlashWindowEx).
+        Только Windows; любые ошибки проглатываются — уведомление не та
+        вещь, из-за которой приложение имеет право упасть.
+        """
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _FLASHWINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.UINT),
+                    ("hwnd", wintypes.HWND),
+                    ("dwFlags", wintypes.DWORD),
+                    ("uCount", wintypes.UINT),
+                    ("dwTimeout", wintypes.DWORD),
+                ]
+
+            # winfo_id() возвращает дочернее окно Tk, а мигать должно
+            # окно верхнего уровня — берём его через GetParent().
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()
+            info = _FLASHWINFO(
+                ctypes.sizeof(_FLASHWINFO), hwnd,
+                0x00000003 | 0x0000000C,  # FLASHW_ALL | FLASHW_TIMERNOFG
+                5, 0,
+            )
+            ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+        except Exception:
+            pass
+
+    # -----------------------------------------------------------------------
+    # Промт "обратная связь автору"
+    # -----------------------------------------------------------------------
+    def _collect_diagnostics(self) -> str:
+        """
+        Технические данные, которые подставляются в письмо: версия, система
+        и настройки запуска. Сюда сознательно НЕ попадают пути к файлам —
+        в них видно имя пользователя Windows и имя генетического файла.
+        Лог, где такое встречается, прикладывается только по явной галочке.
+        """
+        try:
+            import platform
+            os_line = f"{platform.system()} {platform.release()} ({platform.version()})"
+            arch = platform.machine()
+            py = platform.python_version()
+        except Exception:
+            os_line, arch, py = "неизвестно", "неизвестно", "неизвестно"
+
+        try:
+            eur = self._get_eur_sample_count()
+            eur_text = "все доступные" if eur is None else str(eur)
+        except Exception:
+            eur_text = "неизвестно"
+
+        lines = [
+            f"Версия: {__version__}",
+            f"ОС: {os_line}, {arch}",
+            f"Python: {py}",
+            f"Режим настроек: {self.mode_switch.get()}",
+            f"Источник данных: {self.source_dd.get()}",
+            f"Референсная панель: {self.panel_dd.get()}",
+            f"Формат вывода: {self._get_format_key()}",
+            f"Порог Rsq: {self.rsq_entry.get().strip()}",
+            f"EUR-доноров: {eur_text}",
+            f"Нормализация multiallelic: {'да' if self.normalize_var.get() else 'нет'}",
+            f"Кэш сырых хромосом: {'да' if self.raw_cache_var.get() else 'нет'}",
+            f"Переиспользование доноров: {'да' if self.reuse_donors_var.get() else 'нет'}",
+            f"Активный запуск: {self.current_run_name or 'нет'}",
+            f"Шаг мастера: {self._wizard_step}",
+        ]
+        return "\n".join(lines)
+
+    def _collect_log_tail(self, max_lines: int = FEEDBACK_LOG_LINES) -> str:
+        try:
+            text = self.log_text.get("1.0", "end")
+        except Exception:
+            return ""
+        lines = [line for line in text.splitlines() if line.strip()]
+        return "\n".join(lines[-max_lines:])
+
+    def _build_feedback_text(self, kind: str, subject: str, description: str,
+                             include_log: bool) -> str:
+        parts = [
+            f"Тип обращения: {kind}",
+            f"Тема: {subject}",
+            "",
+            "Описание:",
+            description.strip() or "(не заполнено)",
+            "",
+            "--- Технические данные (заполнено программой) ---",
+            self._collect_diagnostics(),
+        ]
+        if include_log:
+            tail = self._collect_log_tail()
+            parts += ["", f"--- Последние строки лога ---", tail or "(лог пуст)"]
+        return "\n".join(parts)
+
+    def _open_feedback_dialog(self):
+        """
+        Окно обратной связи. Письмо НЕ отправляется программой само:
+        открывается почтовый клиент с уже заполненным письмом, и последнее
+        слово — за пользователем. Так в дистрибутиве не появляется ни
+        SMTP-пароля (его извлёк бы из exe любой желающий и разослал бы с
+        этого ящика спам), ни отправки чего-либо за спиной пользователя —
+        он видит текст письма целиком и может его отредактировать.
+        """
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Обратная связь")
+        dialog.geometry("820x660")
+        dialog.minsize(700, 520)
+        dialog.transient(self)
+        # grab_set() до появления окна на экране на Windows иногда падает —
+        # ставим модальность следующим тиком.
+        dialog.after(200, lambda: dialog.grab_set())
+
+        # Кнопки живут в ЗАКРЕПЛЁННОЙ нижней панели, а не внутри
+        # прокручиваемой области: раньше они прокручивались вместе с
+        # содержимым и не помещались по ширине — «Закрыть» упиралась в
+        # край окна и обрезалась. Панель пакуется первой (side="bottom"),
+        # иначе прокрутка с expand=True забрала бы всё место себе.
+        buttons = ctk.CTkFrame(dialog, fg_color="transparent")
+        buttons.pack(side="bottom", fill="x", padx=15, pady=(0, 15))
+
+        frame = ctk.CTkScrollableFrame(dialog)
+        frame.pack(fill="both", expand=True, padx=15, pady=(15, 10))
+
+        ctk.CTkLabel(
+            frame, text="Сообщить об ошибке или предложить улучшение",
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).pack(anchor="w", pady=(0, 8))
+
+        ctk.CTkLabel(
+            frame,
+            text=(f"Письмо уйдёт на {FEEDBACK_EMAIL}. Программа сама ничего не "
+                  f"отправляет: она откроет вашу почтовую программу с готовым "
+                  f"письмом — перед отправкой его можно прочитать и поправить."),
+            justify="left", text_color="gray60", wraplength=620,
+        ).pack(anchor="w", pady=(0, 12))
+
+        kind_var = ctk.StringVar(value=FEEDBACK_KINDS[0])
+        ctk.CTkSegmentedButton(
+            frame, values=list(FEEDBACK_KINDS), variable=kind_var, width=340,
+        ).pack(anchor="w", pady=(0, 12))
+
+        ctk.CTkLabel(frame, text="Коротко о чём (попадёт в тему письма):").pack(anchor="w")
+        subject_tf = ctk.CTkEntry(frame, width=640,
+                                  placeholder_text="например: не скачиваются доноры chr14")
+        subject_tf.pack(fill="x", pady=(0, 12))
+        attach_input_features(subject_tf)
+
+        ctk.CTkLabel(frame, text="Подробности — что делали и что произошло:").pack(anchor="w")
+        body_tf = ctk.CTkTextbox(frame, height=170)
+        body_tf.pack(fill="x", pady=(0, 12))
+        attach_input_features(body_tf)
+
+        log_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            frame, text=f"Приложить последние {FEEDBACK_LOG_LINES} строк лога",
+            variable=log_var,
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            frame,
+            text=("ℹ С логом разбираться в проблеме заметно проще. Учтите: в "
+                  "нём встречаются пути к файлам, а значит имя пользователя "
+                  "Windows и имя вашего файла с ДНК-данными. Письмо перед "
+                  "отправкой открывается в почтовой программе — лишнее можно "
+                  "удалить прямо там."),
+            justify="left", text_color="gray60", wraplength=620,
+        ).pack(anchor="w", pady=(2, 12))
+
+        status_lbl = ctk.CTkLabel(frame, text="", justify="left",
+                                  text_color="gray60", wraplength=620)
+        status_lbl.pack(anchor="w", pady=(0, 10))
+
+        def _texts():
+            subject = subject_tf.get().strip() or "без темы"
+            full_subject = f"{FEEDBACK_SUBJECT_PREFIX} v{__version__} — {kind_var.get()}: {subject}"
+            body = self._build_feedback_text(
+                kind_var.get(), subject, body_tf.get("1.0", "end"), log_var.get(),
+            )
+            return full_subject, body
+
+        def _mailto_url(subject: str, body: str) -> str:
+            return (f"mailto:{FEEDBACK_EMAIL}"
+                    f"?subject={quote(subject)}&body={quote(body)}")
+
+        def _on_mail():
+            full_subject, body = _texts()
+            saved_note = ""
+            url = _mailto_url(full_subject, body)
+
+            # Слишком длинное письмо почтовый клиент может обрезать на
+            # полуслове. Практически это случается только с приложенным
+            # логом: он в разы длиннее всего остального. Тогда полный текст
+            # сохраняем файлом рядом с программой, а в письме оставляем всё
+            # то же самое, кроме лога, и просим приложить файл вложением.
+            if len(url) > FEEDBACK_MAILTO_URL_LIMIT:
+                path = self._save_feedback_file(body)
+                if path is not None:
+                    saved_note = (f"\n\nЛог не поместился в письмо, поэтому "
+                                  f"полный текст обращения вместе с ним сохранён "
+                                  f"отдельным файлом:\n{path}\n"
+                                  f"Приложите его к письму вложением.")
+                short_body = self._build_feedback_text(
+                    kind_var.get(), subject_tf.get().strip() or "без темы",
+                    body_tf.get("1.0", "end"), include_log=False,
+                ) + saved_note
+                url = _mailto_url(full_subject, short_body)
+                # Даже без лога не влезло — значит очень длинное описание.
+                # Тогда в письме остаётся суть и путь к файлу с полным
+                # текстом. Никаких циклов подгонки: приписка про файл сама
+                # по себе длинная, и цикл «отрезать половину» на ней
+                # никогда бы не сошёлся (на этом приложение уже висло).
+                if len(url) > FEEDBACK_MAILTO_URL_LIMIT:
+                    short_body = (
+                        f"Тип обращения: {kind_var.get()}\n"
+                        f"Тема: {subject_tf.get().strip() or 'без темы'}\n\n"
+                        f"Описание оказалось слишком длинным для письма."
+                        f"{saved_note}"
+                    )
+                    url = _mailto_url(full_subject, short_body)
+
+            try:
+                webbrowser.open(url)
+            except Exception as e:
+                status_lbl.configure(
+                    text=f"⚠ Не удалось открыть почтовую программу: {e}\n"
+                         f"Воспользуйтесь кнопкой «Скопировать текст».",
+                    text_color="#F9A825",
+                )
+                return
+            status_lbl.configure(
+                text=("✓ Почтовая программа открыта — проверьте письмо и нажмите "
+                      "«Отправить». Если окно не появилось, почтовый клиент не "
+                      "настроен: скопируйте текст кнопкой ниже." + saved_note),
+                text_color="#4CAF50" if not saved_note else "#F9A825",
+            )
+
+        def _on_copy():
+            full_subject, body = _texts()
+            self.clipboard_clear()
+            self.clipboard_append(f"Кому: {FEEDBACK_EMAIL}\nТема: {full_subject}\n\n{body}")
+            self.update()
+            status_lbl.configure(
+                text="✓ Текст письма скопирован — вставьте его в почту вручную.",
+                text_color="#4CAF50",
+            )
+
+        def _on_save():
+            _, body = _texts()
+            path = self._save_feedback_file(body, ask=True)
+            if path is not None:
+                status_lbl.configure(text=f"✓ Сохранено: {path}", text_color="#4CAF50")
+
+        # «Закрыть» пакуется ПЕРВОЙ и прижимается вправо: при нехватке
+        # ширины pack обделяет тех, кто добавлен позже, — так ужмутся
+        # вспомогательные кнопки, а выход из окна останется на месте.
+        ctk.CTkButton(buttons, text="Закрыть", width=110,
+                      fg_color="transparent", border_width=1,
+                      command=dialog.destroy).pack(side="right", padx=(10, 0))
+        ctk.CTkButton(buttons, text="✉ Открыть в почте", width=190,
+                      command=_on_mail).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(buttons, text="📋 Скопировать", width=160,
+                      fg_color="transparent", border_width=1,
+                      command=_on_copy).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(buttons, text="💾 В файл", width=140,
+                      fg_color="transparent", border_width=1,
+                      command=_on_save).pack(side="left")
+
+        # Esc закрывает окно — привычнее, чем искать кнопку.
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+        subject_tf.focus_set()
+
+    def _save_feedback_file(self, body: str, ask: bool = False) -> Path | None:
+        """Сохраняет текст обращения в файл. ask=True — со стандартным
+        диалогом сохранения, иначе молча рядом с программой."""
+        default_name = f"helixfilldna_feedback_{datetime.now():%Y%m%d_%H%M%S}.txt"
+        if ask:
+            chosen = filedialog.asksaveasfilename(
+                defaultextension=".txt", initialfile=default_name,
+                filetypes=[("Текстовый файл", "*.txt")],
+            )
+            if not chosen:
+                return None
+            target = Path(chosen)
+        else:
+            target = PROJECT_ROOT / default_name
+        try:
+            target.write_text(body, encoding="utf-8")
+        except OSError:
+            return None
+        return target
+
+    def _peek_log_line(self, msg: str):
+        """
+        Дублирует последнюю содержательную строку лога под шкалой на
+        вкладке "Запуск". Разделители («====») и пустые строки
+        пропускаются — они бы просто гасили полезное сообщение.
+        """
+        text = msg.strip()
+        if not text or set(text) <= set("=-— "):
+            return
+        if len(text) > 140:
+            text = text[:137] + "..."
+        color = "gray60"
+        if text.startswith(("✓", "✅")):
+            color = "#4CAF50"
+        elif text.startswith(("✗", "❌", "ОШИБКА", "⚠")):
+            color = "#F44336"
+        self.last_log_lbl.configure(text=text, text_color=color)
 
     def _upsert_progress_line(self, key: str, text: str):
         """
@@ -1451,6 +3134,8 @@ class App(ctk.CTk):
                 else:
                     self.log_text.insert("end", msg + "\n")
                 self.log_text.see("end")
+                self._peek_log_line(msg)
+                self._update_donor_panel(msg)
         except queue.Empty:
             pass
         self.after(100, self._poll_logs)
@@ -1459,6 +3144,14 @@ class App(ctk.CTk):
         if not self.input_tf.get():
             return "Выберите файл с данными"
         if not self.tmpl_tf.get():
+            if self._is_simple_mode():
+                fmt = SIMPLE_FORMAT_BY_SOURCE.get(self._get_source_key(), "v3")
+                expected = _samples_dir() / SAMPLE_TEMPLATE_NAMES.get(fmt, "template_v3.txt")
+                return (
+                    f"Трафарет для формата {fmt} не найден. Положите файл в\n"
+                    f"{expected}\n"
+                    f"или переключитесь в «{MODE_ADVANCED}» и укажите путь вручную."
+                )
             return "Выберите трафарет"
         if not self._validate_eur_count_entry():
             return "Укажите корректное число EUR-доноров (или включите галочку 'все доступные')"
@@ -1632,10 +3325,20 @@ class App(ctk.CTk):
         return response_holder["value"]
 
     def _show_cancel_donor_btn(self):
-        self.cancel_donor_btn.configure(state="normal")
+        """Показывает кнопку остановки — только на том этапе, где она
+        реально работает (скачивание доноров). В остальное время её на
+        экране нет вовсе, а не «есть, но серая»."""
+        self.cancel_donor_btn.configure(
+            state="normal", text="⏹ Остановить скачивание доноров",
+        )
+        self.stop_box.pack(fill="x", pady=(0, 20), after=self.start_btn)
 
     def _hide_cancel_donor_btn(self):
-        self.cancel_donor_btn.configure(state="disabled")
+        self.stop_box.pack_forget()
+        # Единственная точка, которую вызывают ВСЕ пути выхода из этапа 3
+        # (успех, ошибка, отмена, finally) — заодно снимаем опрос файлов,
+        # чтобы after() не тикал вхолостую после конца скачивания.
+        self._stop_file_watch()
 
     def _on_cancel_donor_download(self):
         """
@@ -1647,7 +3350,7 @@ class App(ctk.CTk):
         ждёт завершения текущей хромосомы.
         """
         self._cancel_donor_download.set()
-        self.cancel_donor_btn.configure(state="disabled")
+        self.cancel_donor_btn.configure(state="disabled", text="⏳ Останавливаю...")
         print("⏳ Запрошена отмена скачивания доноров — завершаю текущую операцию...")
 
     def _ensure_donors(
@@ -1768,6 +3471,12 @@ class App(ctk.CTk):
                 # дефолт DEFAULT_GENOME_BUILD="grch37" независимо от
                 # выбранной панели, и для panel="topmed" доноры качались бы
                 # с GRCh37-зеркал 1000 Genomes вместо GRCh38 (GRCH38_MIRRORS).
+                # Промт "не видно, какой файл качается и сколько мегабайт":
+                # следим за размерами файлов в папке доноров (и в общем
+                # кэше сырых хромосом, если он включён) — это единственный
+                # источник, не зависящий от того, чем идёт закачка.
+                self.after(0, self._start_file_watch,
+                           [output_dir, raw_cache_dir], "donors")
                 download_donors.download_donors_for_chip(
                     positions_json, source, output_dir, pipeline.HTSLIB,
                     progress_cb=donor_progress,
@@ -1817,21 +3526,31 @@ class App(ctk.CTk):
 
     def _set_subprogress(self, stage_n: int, sub_progress: float, text: str):
         """
-        Плавный прогресс внутри этапа: общий прогресс = (stage_n - 1 + sub_progress) / 7.
+        Плавный прогресс внутри этапа: общий прогресс = (stage_n - 1 + sub_progress) / STAGES_TOTAL.
         sub_progress — доля выполнения текущего этапа (0.0 .. 1.0).
         Вызывается только через self.after(0, ...) из фонового потока.
+
+        Делитель — STAGES_TOTAL (6), а не 7: эта шкала показывает прогресс
+        кнопки "Запустить этапы 1-6 (до MIS)", то есть ровно шести этапов.
+        Раньше делитель был 7 (с учётом Этапа 7 — сборки после MIS), из-за
+        чего по завершении подготовки шкала замирала на 6/7 (~86%) и
+        выглядела недоделанной, хотя работа была закончена. Этап 7 живёт в
+        отдельной секции вкладки и рисует эту же шкалу своим собственным
+        _set_stage7_progress() от 0 до 1.
         """
         sub_progress = max(0.0, min(1.0, sub_progress))
-        overall = (stage_n - 1 + sub_progress) / 7
+        overall = (stage_n - 1 + sub_progress) / STAGES_TOTAL
         self.progress.set(overall)
-        self.stage_lbl.configure(text=f"[{stage_n}/7] {text}")
-        print(f"[{stage_n}/7] {text}")
+        self._update_eta(overall)
+        self.stage_lbl.configure(text=f"[{stage_n}/{STAGES_TOTAL}] {text}")
+        print(f"[{stage_n}/{STAGES_TOTAL}] {text}")
 
     # --- Задача 7: прогресс + краткие сообщения этапа 7 -------------------
     def _set_stage7_progress(self, frac: float, text: str):
         """frac в диапазоне 0.0..1.0: 0-0.5 скачивание, 0.5-1.0 сборка."""
         frac = max(0.0, min(1.0, frac))
         self.progress.set(frac)
+        self._update_eta(frac)
         self.stage_lbl.configure(text=text)
         print(text)
 
@@ -1862,10 +3581,14 @@ class App(ctk.CTk):
         self._set_active_run(run_dir, run_name)
 
         self.running = True
+        self._run_started_at = time.monotonic()
         self.start_btn.configure(state="disabled")
-        self.mis_btn.configure(state="disabled")
         self.progress.set(0)
         self.stage_lbl.configure(text="Запуск...")
+        self.eta_lbl.configure(text="", text_color="gray60")
+        self._reset_donor_panel()
+        self._set_wizard_step(1)
+        self._refresh_mis_btn_state()
         threading.Thread(target=self._run_stages_1_6, daemon=True).start()
 
     def _on_mis(self):
@@ -1874,9 +3597,9 @@ class App(ctk.CTk):
         if self.current_run_dir is None:
             messagebox.showwarning(
                 "Предупреждение",
-                "Не выбран активный запуск. Выполните Этап 1-6, либо "
-                "выберите завершённый запуск в «Истории запусков» и "
-                "нажмите «▶ Продолжить (Этап 2)».",
+                "Не выбран активный запуск. Выполните Шаг 1, либо "
+                "разверните «Подробнее», выберите завершённый запуск в "
+                "списке и нажмите «▶ Продолжить (Шаг 3)».",
             )
             return
         curl = self.curl_tf.get("1.0", "end").strip()
@@ -1906,8 +3629,11 @@ class App(ctk.CTk):
         if bd and str(bd) not in os.environ.get("PATH", ""):
             os.environ["PATH"] = str(bd) + os.pathsep + os.environ.get("PATH", "")
         self.running = True
-        self.mis_btn.configure(state="disabled")
+        self._run_started_at = time.monotonic()
         self.progress.set(0)
+        self.eta_lbl.configure(text="", text_color="gray60")
+        self._set_wizard_step(3)
+        self._refresh_mis_btn_state()
         threading.Thread(target=self._run_stage_7, daemon=True).start()
 
     # -----------------------------------------------------------------------
@@ -1994,6 +3720,10 @@ class App(ctk.CTk):
                         if choice == "switch":
                             new_name = pipeline.SOURCES[detected_source]["name"]
                             self.after(0, self.source_dd.set, new_name)
+                            # CTkOptionMenu.set() не вызывает command=,
+                            # поэтому в обычном режиме пресеты (формат
+                            # вывода/трафарет) пересчитываем явно.
+                            self.after(0, self._on_source_changed)
                             source = detected_source
                             print(f"✓ Источник переключён на: {new_name}")
                         # choice == "continue" — ничего не меняем, source
@@ -2242,6 +3972,9 @@ class App(ctk.CTk):
 
                 self.after(0, self._enable_mis_btn)
                 self.after(0, self._refresh_run_history)
+                # Файлы готовы — пользователю дальше на сайт MIS.
+                self.after(0, self._set_wizard_step, 2)
+                self.after(0, self._notify_done, True)
 
                 if os.name == "nt":
                     os.startfile(str(upload_dir))
@@ -2263,6 +3996,7 @@ class App(ctk.CTk):
             short_msg = full_msg if len(full_msg) <= 120 else full_msg[:117] + "..."
             self.after(0, self._log_error, f"⚠ Запуск прерван: {full_msg}")
             self.after(0, lambda m=short_msg: self.stage_lbl.configure(text=f"⚠ Прервано: {m}"))
+            self.after(0, self._notify_done, False)
         except Exception as e:
             # Формируем текст СРАЗУ (а не внутри lambda) — переменная
             # исключения 'e' удаляется Python'ом при выходе из блока except,
@@ -2279,6 +4013,7 @@ class App(ctk.CTk):
             self.after(0, self._log_error, f"❌ Ошибка: {full_msg}")
             self.after(0, self._log_error, tb_text)
             self.after(0, lambda m=short_msg: self.stage_lbl.configure(text=f"❌ Ошибка: {m}"))
+            self.after(0, self._notify_done, False)
         finally:
             stdout_redirector.close()
             stderr_redirector.close()
@@ -2330,6 +4065,12 @@ class App(ctk.CTk):
                 results_dir.mkdir(exist_ok=True)
 
                 self.after(0, self._set_stage7_progress, 0.0, "Скачивание результатов MIS...")
+                # Промт "не видно прогресса на Шаге 3": следим за папкой
+                # rerun_results теми же средствами, что и за донорами —
+                # download_mis_results_smart() своего прогресса не отдаёт,
+                # а размеры файлов на диске честны независимо от того,
+                # чем именно качается и распаковывается архив.
+                self.after(0, self._start_file_watch, [results_dir], "mis")
                 # Промт "проверять уже скачанные файлы + предлагать повтор
                 # при ошибке": уже присутствующие в results_dir непустые
                 # файлы пропускаются автоматически (см.
@@ -2340,6 +4081,8 @@ class App(ctk.CTk):
                     curl, results_dir, pwd,
                     on_file_error=self._prompt_file_download_retry,
                 )
+                self.after(0, self._stop_file_watch)
+                self.after(0, self.mis_files_box.pack_forget)
                 self.after(0, self._set_stage7_progress, 0.5, "Скачивание завершено, начинаю сборку...")
 
                 tmpl_path = Path(self.tmpl_tf.get())
@@ -2434,7 +4177,17 @@ class App(ctk.CTk):
                 genotypes = pipeline.merge_dictionaries(imputed, measured)
 
                 self.after(0, self._set_stage7_progress, 0.85, "Сборка финального файла...")
-                output_path = output_dir / f"genotek_23andme_{fmt}.txt"
+                # Промт "итоговый файл в отдельной папке": результат больше
+                # не ложится в рабочую папку запуска вперемешку с
+                # промежуточными VCF и логами — все итоговые файлы всех
+                # запусков собираются в results/ рядом с программой, с
+                # именем запуска в начале, чтобы не путались между собой.
+                # _unique_result_path() не даёт повторной сборке того же
+                # запуска (например с другим Rsq) молча затереть прошлый файл.
+                results_root = _results_dir()
+                output_path = _unique_result_path(
+                    results_root / f"{self.current_run_name}_genotek_23andme_{fmt}.txt"
+                )
                 pipeline.assemble_final(
                     skeleton, genotypes, output_path,
                     format_version=fmt,
@@ -2453,7 +4206,10 @@ class App(ctk.CTk):
                         finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         format=fmt,
                         rsq_threshold=rsq_threshold,
+                        result_file=str(output_path),
                     )
+                    self._last_result_path = output_path
+                    self.after(0, self._refresh_result_label)
                     self.after(0, self._refresh_run_history)
                     self.after(0, self._log_success, "=" * 60)
                     self.after(0, self._log_success, f"✅ ГОТОВО! Файл: {output_path}")
@@ -2473,23 +4229,28 @@ class App(ctk.CTk):
                         )
                     self.after(0, self._log_success, "=" * 60)
                     self.after(0, lambda: self.stage_lbl.configure(text=short_msg))
-                    if os.name == "nt":
-                        os.startfile(str(output_dir))
+                    self.after(0, self._notify_done, True)
+                    # Открываем именно папку с результатом, а не рабочую
+                    # папку запуска: пользователю нужен собранный файл.
+                    self.after(0, self._open_in_file_manager, results_root)
                 else:
                     first_err = validation.errors[0] if validation.errors else "неизвестная ошибка валидации"
                     short_msg = f"❌ Ошибка: {first_err}"
                     for err in validation.errors:
                         self.after(0, self._log_error, f"❌ {err}")
                     self.after(0, lambda m=short_msg: self.stage_lbl.configure(text=m))
+                    self.after(0, self._notify_done, False)
 
         except Exception as e:
             full = str(e)
             short = full if len(full) <= 120 else full[:117] + "..."
             self.after(0, self._log_error, f"❌ Ошибка: {full}")
             self.after(0, lambda m=short: self.stage_lbl.configure(text=f"❌ {m}"))
+            self.after(0, self._notify_done, False)
         finally:
             stdout_redirector.close()
             stderr_redirector.close()
+            self.after(0, self._stop_file_watch)
             self.after(0, self._enable_mis_btn)
 
     # -----------------------------------------------------------------------
@@ -2506,10 +4267,19 @@ class App(ctk.CTk):
     def _enable_start_btn(self):
         self.start_btn.configure(state="normal")
         self.running = False
+        self._run_started_at = None
+        self._refresh_mis_btn_state()
 
     def _enable_mis_btn(self):
-        self.mis_btn.configure(state="normal")
+        """
+        Раньше просто включал кнопку Шага 3. Теперь решение о её
+        доступности принимает _refresh_mis_btn_state(): одной готовности
+        файлов мало — нужны ещё curl-команда и пароль из письма, и когда
+        их нет, пользователь видит под кнопкой, чего именно не хватает.
+        """
         self.running = False
+        self._run_started_at = None
+        self._refresh_mis_btn_state()
 
 
 # ---------------------------------------------------------------------------

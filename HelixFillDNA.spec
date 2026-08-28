@@ -29,15 +29,21 @@ pyfaidx_datas, pyfaidx_binaries, pyfaidx_hidden = collect_all("pyfaidx")
 #   - bin/  -> все htslib-бинарники и DLL (bcftools.exe/tabix.exe/bgzip.exe +
 #     их зависимости + cacert.pem) — код ищет их по --bin-dir/PROJECT_ROOT/"bin",
 #     поэтому кладём в подпапку bin/ рядом с exe.
-#   - template/  -> только __init__.py (шаблоны *.txt пользователь выбирает
-#     сам через диалог "Обзор" — не включаем 38 МБ template_v3/v5.txt).
-#     Если хотите дать пример трафарета — раскомментируйте отдельной строкой.
+#   - template/  -> только __init__.py (это python-пакет сборщика, сами
+#     трафареты *.txt лежат не здесь, а в samples/, см. ниже).
+#   - samples/   -> трафареты template_v3.txt (FTDNA) и template_v5.txt
+#     (MyHeritage) СЮДА НЕ ВКЛЮЧАЮТСЯ СПЕЦИАЛЬНО. Промт "обычные /
+#     продвинутые настройки": в обычном режиме GUI подставляет трафарет из
+#     папки samples/ сам, и папка эта должна оказаться ровно в {app}\samples
+#     у установленного приложения. PyInstaller, в зависимости от версии,
+#     кладёт datas либо плоско рядом с exe, либо в _internal/ (та же
+#     неопределённость, из-за которой существует _detect_bin_dir() в
+#     gui/app.py) — поэтому трафареты кладёт НЕ PyInstaller, а Inno Setup:
+#     см. секцию [Files] в HelixFillDNA.iss, там путь к {app}\samples задан
+#     явно и от раскладки PyInstaller не зависит.
 # ---------------------------------------------------------------------------
 app_datas = [
     (os.path.join(PROJECT_ROOT, "bin"), "bin"),
-    # Пример шаблона (раскомментировать при необходимости):
-    # (os.path.join(PROJECT_ROOT, "template", "template_v3.txt"), "template"),
-    # (os.path.join(PROJECT_ROOT, "template", "template_v5.txt"), "template"),
 ]
 
 a = Analysis(
@@ -67,6 +73,7 @@ a = Analysis(
         "template.assembler",
         "template.skeleton",
         "main",
+        "version",
         "mis_adapter",
         "download_donors",
     ],

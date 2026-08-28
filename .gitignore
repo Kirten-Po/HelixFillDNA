@@ -8,3 +8,12 @@ output/
 *.egg-info/
 .venv/
 venv/
+# samples/ НЕ игнорируется: трафареты template_v3/v5.txt должны быть в
+# репозитории, иначе сборка установщика в GitHub Actions (.github/
+# workflows/release.yml) их не увидит и они не попадут в {app}\samples.
+# Файлы, создаваемые самой программой при работе
+ui_state.json
+reference/
+results/
+venv311/
+helixfilldna_feedback_*.txt
