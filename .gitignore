@@ -8,9 +8,17 @@ output/
 *.egg-info/
 .venv/
 venv/
-# samples/ НЕ игнорируется: трафареты template_v3/v5.txt должны быть в
-# репозитории, иначе сборка установщика в GitHub Actions (.github/
+# samples/ НЕ игнорируется целиком: трафареты template_v3/v5.txt должны
+# быть в репозитории, иначе сборка установщика в GitHub Actions (.github/
 # workflows/release.yml) их не увидит и они не попадут в {app}\samples.
+# Но всё ОСТАЛЬНОЕ в samples/ — это чьи-то сырые данные ДНК, которым в
+# публичном репозитории не место. Поэтому список разрешённого, а не
+# запрещённого: любой новый файл в samples/ по умолчанию не коммитится,
+# пока его явно не добавят исключением ниже.
+samples/*
+!samples/README.txt
+!samples/template_v3.txt
+!samples/template_v5.txt
 # Файлы, создаваемые самой программой при работе
 ui_state.json
 reference/

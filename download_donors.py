@@ -3047,15 +3047,19 @@ def main():
     parser.add_argument("--positions-json", required=False, type=Path, default=None,
                          help="<signature>.positions.json из save_position_cache() — "
                               "предпочтительный способ, работает для любого "
-                              "источника (ftdna/myheritage/vcf), в отличие от --csv. "
+                              "источника (ftdna/myheritage/ancestry/vcf), "
+                              "в отличие от --csv. "
                               "При указании этого флага скачивание идёт через "
                               "download_donors_for_chip() с автоматической "
                               "инвалидацией устаревшего кэша при смене чипа.")
-    parser.add_argument("--source", choices=["ftdna", "myheritage", "vcf"], default=None,
+    parser.add_argument("--source",
+                         choices=["ftdna", "myheritage", "ancestry", "vcf"],
+                         default=None,
                          help="Источник данных — используется только для сообщений/подсказок")
     parser.add_argument("--donors-subdir", type=str, default=None,
                          help="Подпапка внутри --output-dir для раздельного хранения "
-                              "доноров по источнику, напр. ftdna/myheritage/vcf. "
+                              "доноров по источнику, напр. "
+                              "ftdna/myheritage/ancestry/vcf. "
                               "Без неё поведение остаётся плоским (legacy)")
     parser.add_argument("--output-dir", type=Path, default=Path("donors"))
     parser.add_argument("--bin-dir", type=Path, default=None, help="Папка с bcftools.exe/tabix.exe")

@@ -224,6 +224,15 @@ from adapters.vcf_source import (
     save_position_cache as _save_position_cache_vcf,
     _open_text as _vcf_open_text,
 )
+from adapters.ancestry_v2 import (
+    parse_ancestry_v2, AncestryFormatError,
+    save_position_cache as _save_position_cache_ancestry,
+    save_position_cache_broad as _save_position_cache_broad_ancestry,
+    EXPECTED_HEADER as _ANCESTRY_HEADER_TOKENS,
+)
+from core.ancestry_convert import (
+    prepare_ancestry_file, AncestryConvertError, CONVERTED_SUFFIX,
+)
 from core.pure_python_core import build_vcf, split_autosomes, PureCoreError, _chrom_sort_key
 from core.archive_utils import sanitize_password_text
 from core.network_utils import ensure_network_ready
@@ -425,6 +434,12 @@ SOURCES = {
         "save_position_cache": _save_position_cache_myheritage,
         "save_position_cache_broad": _save_position_cache_broad_myheritage,
     },
+    "ancestry": {
+        "name": "AncestryDNA (.txt)",
+        "parser": parse_ancestry_v2,
+        "save_position_cache": _save_position_cache_ancestry,
+        "save_position_cache_broad": _save_position_cache_broad_ancestry,
+    },
     "vcf": {
         "name": "Готовый VCF (свой файл / WGS)",
         "parser": parse_vcf_source,
@@ -440,7 +455,65 @@ SOURCES = {
 
 def _needs_reference(source: str) -> bool:
     """VCF-источнику референс не нужен — REF/ALT/GT там уже разрешены."""
-    return source in ("ftdna", "myheritage")
+    return source in ("ftdna", "myheritage", "ancestry")
+
+
+#: Источники, которым перед Этапом 1 нужен отдельный шаг приведения
+#: файла к оформлению 23andMe v3 (Этап 0). Пока такой один — AncestryDNA:
+#: его сырой экспорт отличается от 23andMe не содержанием, а оформлением
+#: (5 колонок, коды хромосом 23-26, пропуск как аллель '0'), и отдельный
+#: шаг оставляет на диске промежуточный файл, который можно проверить
+#: глазами и залить в Генотек как есть — см. core/ancestry_convert.py.
+_SOURCES_NEEDING_CONVERSION = ("ancestry",)
+
+
+def _default_conversion_template(template_path: Optional[Path] = None) -> Optional[Path]:
+    """
+    Откуда взять '#'-шапку для конвертированного файла.
+
+    Целевое оформление Этапа 0 — всегда v3, независимо от того, какой
+    трафарет выбран для СБОРКИ ИТОГОВОГО файла на Этапе 7 (пользователь
+    может выбрать v5, и это не должно менять промежуточный файл).
+    Поэтому по умолчанию берётся samples/template_v3.txt, и только если
+    его нет — переданный трафарет, а если нет и его, конвертер подставит
+    встроенную шапку.
+    """
+    bundled_v3 = PROJECT_ROOT / "samples" / "template_v3.txt"
+    if bundled_v3.is_file():
+        return bundled_v3
+    if template_path is not None and Path(template_path).is_file():
+        return Path(template_path)
+    return None
+
+
+def prepare_source_file(
+    source: str,
+    csv_path: Path,
+    output_dir: Path,
+    template_path: Optional[Path] = None,
+) -> tuple[Path, Optional[object]]:
+    """
+    Этап 0. Возвращает (файл_для_парсинга, статистика_конвертации).
+
+    Для источников не из _SOURCES_NEEDING_CONVERSION возвращает исходный
+    путь и None — то есть для FTDNA/MyHeritage/VCF поведение пайплайна не
+    меняется вообще, вызов этой функции для них бесплатный.
+
+    Для 'ancestry' конвертирует сырой экспорт в
+    output_dir/<имя>_23andme_v3.txt и возвращает путь к нему; дальше все
+    обычные этапы идут уже по конвертированному файлу. Если на вход
+    подсунули УЖЕ конвертированный файл (или любой другой в формате
+    23andMe), конвертация пропускается — см. prepare_ancestry_file().
+    """
+    csv_path = Path(csv_path)
+    if source not in _SOURCES_NEEDING_CONVERSION:
+        return csv_path, None
+
+    stats = prepare_ancestry_file(
+        csv_path, Path(output_dir),
+        template_path=_default_conversion_template(template_path),
+    )
+    return Path(stats.out_path), stats
 
 
 def _supports_liftover(source: str) -> bool:
@@ -458,8 +531,12 @@ def _supports_liftover(source: str) -> bool:
     нет. Это отдельная, ещё не реализованная доработка — main()/
     gui/app.py явно предупреждают в лог, если source='vcf' выбран вместе
     с panel="topmed" (координаты в этом случае НЕ переносятся).
+
+    'ancestry' — ДА: parse_ancestry_v2() принимает тот же параметр
+    liftover и применяет его в том же месте (сразу после нормализации
+    chrom/pos, до broad_key и до reference.base_at()).
     """
-    return source in ("ftdna", "myheritage")
+    return source in ("ftdna", "myheritage", "ancestry")
 
 
 def _panel_config(panel: Optional[str]) -> dict:
@@ -607,7 +684,8 @@ def _myheritage_header_synonym_score(tokens: list[str]) -> int:
 
 def detect_source_from_file(path: Path) -> tuple[Optional[str], float]:
     """
-    Определяет вероятный источник ('ftdna' | 'myheritage' | 'vcf' | None)
+    Определяет вероятный источник
+    ('ftdna' | 'myheritage' | 'ancestry' | 'vcf' | None)
     по СОДЕРЖИМОМУ файла, независимо от того, что выбрано в GUI/--source.
 
     Вызывается ДО тяжёлых операций пайплайна (в первую очередь до
@@ -627,14 +705,24 @@ def detect_source_from_file(path: Path) -> tuple[Optional[str], float]:
          нет ни одной '#'-строки-комментария) точно равна
          'RSID,CHROMOSOME,POSITION,RESULT' (после strip каждого поля)
          -> ('ftdna', 0.95).
-      3. MyHeritage: в первых _DETECT_MAX_SCAN_LINES строках
+      3. AncestryDNA: первая непустая строка начинается с
+         '#AncestryDNA' -> ('ancestry', 0.98); либо первая
+         НЕ-комментарийная строка точно равна
+         'rsid\tchromosome\tposition\tallele1\tallele2'
+         -> ('ancestry', 0.95).
+         ⚠ Проверяется СТРОГО ДО правила MyHeritage: у файлов Ancestry
+         18 ведущих '#'-строк, поэтому под правило 4(а) ('10+ строк
+         комментариев подряд') они попадают тоже, и без этой проверки
+         ЛЮБОЙ Ancestry-файл определялся бы как 'myheritage' с
+         уверенностью 0.9.
+      4. MyHeritage: в первых _DETECT_MAX_SCAN_LINES строках
            (а) 10+ строк-комментариев '#' подряд в начале файла, ИЛИ
            (б) в первой не-комментарийной непустой строке табов больше,
                чем запятых (TSV), ИЛИ
            (в) среди токенов этой строки через COLUMN_SYNONYMS находится
                минимум MIN_MATCHED_COLUMNS (3) из 4 канонических колонок
          -> ('myheritage', 0.9).
-      4. Fallback по расширению файла (если ни одна content-эвристика
+      5. Fallback по расширению файла (если ни одна content-эвристика
          выше не сработала):
            '.vcf' / '.vcf.gz' -> ('vcf', 0.5)
            '.csv'              -> ('ftdna', 0.3) — самый частый CSV-
@@ -682,7 +770,22 @@ def detect_source_from_file(path: Path) -> tuple[Optional[str], float]:
             if _looks_like_ftdna_header(first_raw):
                 return "ftdna", 0.95
 
-        # --- 3. MyHeritage -------------------------------------------------
+        # --- 3. AncestryDNA (СТРОГО до MyHeritage, см. докстринг) -----
+        if non_empty[0].lstrip("\ufeff").lower().startswith("#ancestrydna"):
+            return "ancestry", 0.98
+        for line in non_empty:
+            if line.lstrip().startswith("#"):
+                continue
+            # Первая не-комментарийная строка — либо заголовок Ancestry,
+            # либо это другой формат; в обоих случаях дальше не смотрим.
+            tokens = tuple(
+                t.strip().strip('"').lower() for t in line.split("\t")
+            )
+            if tokens == _ANCESTRY_HEADER_TOKENS:
+                return "ancestry", 0.95
+            break
+
+        # --- 4. MyHeritage -------------------------------------------------
         leading_comment_lines = 0
         header_candidate: Optional[str] = None
         for line in non_empty:
@@ -706,7 +809,7 @@ def detect_source_from_file(path: Path) -> tuple[Optional[str], float]:
             if _myheritage_header_synonym_score(tokens) >= _MH_MIN_MATCHED_COLUMNS:
                 return "myheritage", 0.9
 
-        # --- 4. Fallback по расширению --------------------------------------
+        # --- 5. Fallback по расширению --------------------------------------
         name_lower = path.name.lower()
         if name_lower.endswith(".vcf.gz") or name_lower.endswith(".vcf"):
             return "vcf", 0.5
@@ -2662,6 +2765,28 @@ def main() -> None:
         else:
             logger.info("ℹ Автодетект: не удалось определить формат файла %s", args.csv)
 
+    # --- Этап 0: приведение файла к оформлению 23andMe v3 --------------
+    # Только для источников из _SOURCES_NEEDING_CONVERSION; для остальных
+    # это no-op, возвращающий тот же путь. Стоит ДО проверки референса
+    # (которая может качать гигабайты): если файл не того формата, узнать
+    # об этом лучше сразу.
+    csv_for_parsing = Path(args.csv)
+    if args.source in _SOURCES_NEEDING_CONVERSION:
+        print("[0a/7] Приведение исходного файла к оформлению 23andMe v3")
+        try:
+            # output_dir — папка ЭТОГО запуска (output/runs/<имя>), а не
+            # общий корень output/: конвертированный файл принадлежит
+            # конкретному запуску и лежит рядом с sample.vcf.gz и run.log.
+            csv_for_parsing, conversion_stats = prepare_source_file(
+                args.source, Path(args.csv), output_dir, args.template,
+            )
+        except AncestryConvertError as e:
+            sys.exit(f"ОШИБКА: {e}")
+        print(f"  {conversion_stats.summary()}")
+        if not conversion_stats.skipped:
+            save_run_info(output_dir,
+                          converted_file=Path(conversion_stats.out_path).name)
+
     print("[0/7] Проверка референсного генома")
     reference = _build_reference(args, args.source, panel=args.panel)
 
@@ -2684,10 +2809,12 @@ def main() -> None:
 
     print("[1/7] Парсинг исходных данных")
     parser_fn = SOURCES[args.source]["parser"]
+    # csv_for_parsing — результат Этапа 0 (для 'ancestry') либо сам
+    # args.csv (для всех остальных источников).
     if _supports_liftover(args.source):
-        result = parser_fn(Path(args.csv), reference, liftover=liftover)
+        result = parser_fn(csv_for_parsing, reference, liftover=liftover)
     else:
-        result = parser_fn(Path(args.csv), reference)
+        result = parser_fn(csv_for_parsing, reference)
     print(f"  Годных вариантов: {len(result.variants)}, сигнатура: {result.chip_signature}")
     if getattr(result, "lift_failed", 0):
         print(f"  ⚠ Не перенесено лифтовером на целевую сборку (lift_failed): {result.lift_failed}")

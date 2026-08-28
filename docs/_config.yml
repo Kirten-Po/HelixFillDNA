@@ -1,7 +1,7 @@
 title: HelixFillDNA
 description: >-
-  Конвертация сырых данных ДНК (FTDNA / MyHeritage / VCF) в формат
-  23andMe для импутации и загрузки в Генотек.
+  Конвертация сырых данных ДНК (FTDNA / MyHeritage / AncestryDNA / VCF)
+  в формат 23andMe для импутации и загрузки в Генотек.
 theme: minima
 
 # ⚠ Плейсхолдер: замените <owner> на реальный аккаунт/организацию

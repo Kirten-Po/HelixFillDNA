@@ -63,8 +63,9 @@ title: HelixFillDNA
     HelixFillDNA
   </h1>
   <p class="tagline">
-    Конвертирует сырые данные ДНК (FTDNA, MyHeritage или готовый VCF)
-    в формат 23andMe — для импутации и последующей загрузки в Генотек.
+    Конвертирует сырые данные ДНК (FTDNA, MyHeritage, AncestryDNA или
+    готовый VCF) в формат 23andMe — для импутации и последующей загрузки
+    в Генотек.
   </p>
   <a class="btn-download"
      href="https://github.com/{{ site.repository }}/releases/latest">
@@ -127,8 +128,8 @@ HelixFillDNA автоматизирует весь процесс — импут
     и запустите его — права администратора не нужны.
   </li>
   <li>
-    <strong>Выберите свой файл</strong> — сырой экспорт FTDNA, MyHeritage
-    или готовый VCF. Трафарет (образец экспорта 23andMe, по которому
+    <strong>Выберите свой файл</strong> — сырой экспорт FTDNA, MyHeritage,
+    AncestryDNA или готовый VCF. Трафарет (образец экспорта 23andMe, по которому
     собирается итоговый файл) искать не нужно: оба формата входят
     в установщик и подставляются автоматически.
   </li>

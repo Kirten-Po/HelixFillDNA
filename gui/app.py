@@ -441,7 +441,15 @@ MODE_ADVANCED = "Продвинутые настройки"
 # исторически соответствует трафарету v3 (LF), MyHeritage — v5 (CRLF).
 # Готовый VCF не привязан ни к одному из экспортов, поэтому для него берём
 # v3 как более полный по call rate.
-SIMPLE_FORMAT_BY_SOURCE = {"ftdna": "v3", "myheritage": "v5", "vcf": "v3"}
+#
+# AncestryDNA -> v3 по той же причине, что и VCF, но с конкретным
+# основанием: чип Ancestry V2.0 пересекается с трафаретом v3 по 473 136
+# позициям (49,3 % трафарета) и лишь по 167 684 с v5 (26,1 %) — то есть
+# на v3 у него почти втрое больше собственных измерений, которые не
+# придётся импутировать.
+SIMPLE_FORMAT_BY_SOURCE = {
+    "ftdna": "v3", "myheritage": "v5", "ancestry": "v3", "vcf": "v3",
+}
 SIMPLE_RSQ = "0.30"          # стандартный порог MIS
 SIMPLE_EUR_COUNT = 20        # компромисс трафик/качество для обычного режима
 SIMPLE_NORMALIZE = True      # нормализовать multiallelic-сайты перед split
@@ -3754,6 +3762,36 @@ class App(ctk.CTk):
                     eur_sample_count=self._get_eur_sample_count() or "all",
                 )
 
+                # --- Этап 0: приведение файла к оформлению 23andMe v3 ---
+                # Только для источников из
+                # pipeline._SOURCES_NEEDING_CONVERSION (сейчас это
+                # 'ancestry'); для остальных prepare_source_file() —
+                # no-op, возвращающий тот же путь, поэтому FTDNA/
+                # MyHeritage/VCF этот блок никак не задевает.
+                #
+                # Стоит ДО "[0/7] Проверка референсного генома" по той же
+                # причине, что и автодетект источника выше: проверка
+                # референса может качать и хешировать гигабайты, и если
+                # файл окажется не того формата, узнать об этом лучше до
+                # неё, а не после.
+                #
+                # Конвертированный файл кладём в папку запуска — он
+                # самостоятельный результат: его можно проверить глазами
+                # и загрузить в Генотек как есть, не дожидаясь импутации.
+                csv_for_parsing = csv_path
+                if source in pipeline._SOURCES_NEEDING_CONVERSION:
+                    self.after(0, self._set_subprogress, 1, 0.0,
+                               "Приведение к формату 23andMe v3...")
+                    csv_for_parsing, conversion_stats = pipeline.prepare_source_file(
+                        source, csv_path, output_dir, Path(self.tmpl_tf.get()),
+                    )
+                    print(f"✓ Этап 0: {conversion_stats.summary()}")
+                    if not conversion_stats.skipped:
+                        pipeline.save_run_info(
+                            output_dir,
+                            converted_file=Path(conversion_stats.out_path).name,
+                        )
+
                 print("[0/7] Проверка референсного генома")
                 reference = None
                 if source != "vcf":
@@ -3803,10 +3841,12 @@ class App(ctk.CTk):
                 # --- Этап 1: Парсинг --------------------------------------
                 self.after(0, self._set_subprogress, 1, 0.05, "Чтение файла...")
                 parser_fn = pipeline.SOURCES[source]["parser"]
+                # csv_for_parsing — результат Этапа 0 (для 'ancestry')
+                # либо сам csv_path (для всех остальных источников).
                 if pipeline._supports_liftover(source):
-                    result = parser_fn(csv_path, reference, liftover=liftover)
+                    result = parser_fn(csv_for_parsing, reference, liftover=liftover)
                 else:
-                    result = parser_fn(csv_path, reference)
+                    result = parser_fn(csv_for_parsing, reference)
                 self.after(0, self._set_subprogress, 1, 0.5, "Разрешение ориентации...")
                 print(f"Годных вариантов: {len(result.variants)}, сигнатура: {result.chip_signature}")
                 if getattr(result, "lift_failed", 0):
