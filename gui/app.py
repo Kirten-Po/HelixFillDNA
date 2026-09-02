@@ -295,7 +295,28 @@ _DONOR_RANK_FILTER = 3
 _DONOR_RANK_DONE = 4
 _DONOR_RANK_FAILED = 5  # выше "готово": ошибку не должно перекрывать ничем
 
-_DONOR_CHR_RE = re.compile(r"chr(\d{1,2})\b", re.IGNORECASE)
+# X добавлена вместе с поддержкой импутации X-хромосомы — иначе строки
+# лога и файлы вида "chrX ..." панель молча игнорировала.
+_DONOR_CHR_RE = re.compile(r"chr(\d{1,2}|X)\b", re.IGNORECASE)
+# Хромосомы карты доноров, в порядке отображения (ключи — строки, чтобы
+# "X" и номера жили в одном словаре).
+DONOR_PANEL_CHROMS: list[str] = [str(i) for i in range(1, 23)] + ["X"]
+
+
+def _normalise_donor_chrom(raw: str):
+    """Приводит захваченное регэкспом имя хромосомы к ключу карты
+    доноров ("1".."22", "X") либо возвращает None, если это не наша
+    хромосома."""
+    token = raw.upper()
+    if token == "X":
+        return "X"
+    try:
+        num = int(token)
+    except ValueError:
+        return None
+    return str(num) if 1 <= num <= 22 else None
+
+
 # Процент может быть дробным (curl --progress-bar печатает "30.7%"), и без
 # необязательной дробной части регэксп цеплялся бы за "7%" вместо "30%".
 _DONOR_PCT_RE = re.compile(r"(\d{1,3})(?:[.,]\d+)?\s*%")
@@ -322,11 +343,8 @@ def _parse_donor_state(msg: str):
     match = _DONOR_CHR_RE.search(msg)
     if not match:
         return None
-    try:
-        chrom = int(match.group(1))
-    except ValueError:
-        return None
-    if not 1 <= chrom <= 22:
+    chrom = _normalise_donor_chrom(match.group(1))
+    if chrom is None:
         return None
 
     low = msg.lower()
@@ -940,7 +958,7 @@ class App(ctk.CTk):
             self.geometry("1000x750")
         self.minsize(850, 650)
         # Открываемся развёрнутыми на весь экран: на вкладке "Запуск" три
-        # шага, шкала прогресса и карта из 22 хромосом — в окне 1000x750
+        # шага, шкала прогресса и карта из 23 хромосом — в окне 1000x750
         # это сплошная прокрутка.
         #
         # after(0) — а не прямой вызов: customtkinter при первом показе
@@ -979,7 +997,7 @@ class App(ctk.CTk):
         self._run_started_at: float | None = None
         self._run_details_visible = False
         # Карта состояний донорских хромосом этапа 3: {номер: (ранг, текст)}.
-        self._donor_states: dict[int, tuple[int, str]] = {}
+        self._donor_states: dict[str, tuple[int, str]] = {}
         # Наблюдение за папками доноров: какие папки опрашивать, последние
         # увиденные размеры файлов и id запланированного after()-вызова.
         self._donor_watch_dirs: list[Path] = []
@@ -1268,7 +1286,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(
             adv,
             text=("ℹ Строит сигнатуру чипа по всем измеренным позициям вместо позиций, "
-                  "прошедших личный QC. Позволяет не перекачивать ~22 файла доноров "
+                  "прошедших личный QC. Позволяет не перекачивать ~23 файла доноров "
                   "для каждого нового человека на том же чипе. Требует пересборки "
                   "batch_merged без принудительной подстановки 0/0 на пропусках — "
                   "это уже обеспечено в этой версии."),
@@ -1500,7 +1518,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(
             scroll,
             text=("Программа прочитает ваш файл, скачает донорские хромосомы "
-                  "1000 Genomes и подготовит 22 файла для загрузки на сервер "
+                  "1000 Genomes и подготовит 23 файла (1-22 + X) для загрузки на сервер "
                   "импутации. Самая долгая часть — скачивание доноров (этап 3), "
                   "оно может идти несколько часов."),
             justify="left", text_color="gray60", wraplength=760,
@@ -1542,9 +1560,8 @@ class App(ctk.CTk):
         ).grid(row=0, column=0, columnspan=DONOR_GRID_COLUMNS, sticky="w",
                padx=10, pady=(8, 6))
 
-        self.donor_chr_lbls: dict[int, ctk.CTkLabel] = {}
-        for chrom in range(1, 23):
-            idx = chrom - 1
+        self.donor_chr_lbls: dict[str, ctk.CTkLabel] = {}
+        for idx, chrom in enumerate(DONOR_PANEL_CHROMS):
             row = 1 + idx // DONOR_GRID_COLUMNS
             col = idx % DONOR_GRID_COLUMNS
             lbl = ctk.CTkLabel(
@@ -1556,7 +1573,7 @@ class App(ctk.CTk):
         for col in range(DONOR_GRID_COLUMNS):
             self.donor_panel.grid_columnconfigure(col, weight=1)
 
-        base_row = 1 + (21 // DONOR_GRID_COLUMNS) + 1
+        base_row = 1 + ((len(DONOR_PANEL_CHROMS) - 1) // DONOR_GRID_COLUMNS) + 1
         # Что качается прямо сейчас: имя файла, сколько мегабайт уже на
         # диске и с какой скоростью растёт. Заполняется _poll_donor_files().
         self.donor_active_lbl = ctk.CTkLabel(
@@ -1594,7 +1611,7 @@ class App(ctk.CTk):
             command=self._on_open_mis_site,
         ).pack(side="left", padx=(0, 8))
         ctk.CTkButton(
-            mis_actions, text="📂 Папка с 22 файлами", width=210,
+            mis_actions, text="📂 Папка с 23 файлами", width=210,
             command=self._on_open_upload_folder,
         ).pack(side="left")
 
@@ -2146,7 +2163,7 @@ class App(ctk.CTk):
         # абзаце они терялись.
         self.run_instructions_lbl.configure(text=(
             "Этот шаг делается руками на сайте импутации:\n"
-            "1. Откройте сайт и загрузите на него 22 файла из папки запуска "
+            "1. Откройте сайт и загрузите на него 23 файла (1-22 + X) из папки запуска "
             "(обе кнопки ниже).\n"
             "2. В форме выберите параметры из синей рамки.\n"
             "3. Дождитесь письма со ссылкой и паролем и вставьте их в Шаге 3.\n"
@@ -2396,14 +2413,14 @@ class App(ctk.CTk):
         self._set_wizard_step(1)
 
     def _current_upload_dir(self) -> Path | None:
-        """Папка с 22 файлами для загрузки на MIS у активного запуска."""
+        """Папка с 23 файлами (1-22 + X) для загрузки на MIS у активного запуска."""
         if self.current_run_dir is None:
             return None
         return self.current_run_dir / "upload"
 
     def _on_open_upload_folder(self):
         """
-        «📂 Папка с 22 файлами»: открывает output/runs/<запуск>/upload —
+        «📂 Папка с 23 файлами»: открывает output/runs/<запуск>/upload —
         иначе пользователю приходится искать её в проводнике руками.
         """
         upload_dir = self._current_upload_dir()
@@ -2573,8 +2590,8 @@ class App(ctk.CTk):
 
                 match = _DONOR_CHR_RE.search(path.name) if donors else None
                 if match:
-                    chrom = int(match.group(1))
-                    if 1 <= chrom <= 22:
+                    chrom = _normalise_donor_chrom(match.group(1))
+                    if chrom is not None:
                         kind = "индекс" if path.name.endswith(".tbi") else "⬇"
                         self._set_donor_cell(
                             chrom,
@@ -2645,7 +2662,7 @@ class App(ctk.CTk):
         if hasattr(self, "donor_panel") and not self.donor_panel.winfo_manager():
             self.donor_panel.pack(fill="x", pady=(10, 0))
 
-    def _set_donor_cell(self, chrom: int, text: str, color: str, rank: int):
+    def _set_donor_cell(self, chrom: str, text: str, color: str, rank: int):
         """
         Ставит состояние одной хромосоме. Единая точка входа и для разбора
         строк лога (_update_donor_panel), и для опроса файлов на диске
@@ -2671,7 +2688,7 @@ class App(ctk.CTk):
         # готовых упавшая хромосома, разумеется, не входит.
         done = sum(1 for r, _ in self._donor_states.values() if r == _DONOR_RANK_DONE)
         failed = sum(1 for r, _ in self._donor_states.values() if r == _DONOR_RANK_FAILED)
-        summary = f"Готово {done} из 22"
+        summary = f"Готово {done} из {len(self.donor_chr_lbls)}"
         if failed:
             summary += f", с ошибкой {failed}"
         self.donor_summary_lbl.configure(text=summary)
@@ -3433,7 +3450,7 @@ class App(ctk.CTk):
                 f"(который для VCF действительно не нужен), а нужны для "
                 f"самого шага импутации на Michigan Imputation Server. Каждый "
                 f"новый источник/чип требует своего кэша доноров.\n\n"
-                f"Скачать ~22 файла доноров 1000 Genomes автоматически?\n"
+                f"Скачать ~23 файла доноров 1000 Genomes автоматически?\n"
                 f"Трафик скачивания может составить несколько десятков ГБ "
                 f"(итоговый размер отфильтрованных файлов на диске "
                 f"меньше).",
@@ -3449,7 +3466,7 @@ class App(ctk.CTk):
                     f"требуют donors/{source}/{panel}/.\n\n"
                     "Запуск будет прерван. Файлы, подготовленные до этого "
                     "шага (sample.vcf.gz), останутся в папке запуска, но "
-                    "собрать 22 файла для загрузки на MIS не получится, пока "
+                    "собрать 23 файла для загрузки на MIS не получится, пока "
                     "доноры не будут скачаны.",
                 )
                 raise UserCancelledRun(
@@ -3897,9 +3914,31 @@ class App(ctk.CTk):
                 # без него CHROM в sample.vcf.gz для panel="topmed" писался
                 # бы без "chr", и bcftools merge с GRCh38-донорами (Этап 5)
                 # молча не находил бы пересечений по CHROM.
+                # Промт "Покрытие X-хромосомы": плоидность мужского X
+                # (Ploidy Check на MIS) — см. build_vcf(haploid_x=...).
+                male, x_het_pct, x_calls = pipeline.infer_male_from_variants(
+                    result.variants, genome_build=panel_cfg["genome_build"],
+                )
+                # print(), а не self.after(0, ...): stdout этого потока
+                # перехвачен LogRedirector'ом и уже попадает в лог окна —
+                # отдельного метода для нейтральных сообщений у окна нет
+                # (есть только _log_success/_log_error).
+                if x_calls:
+                    print(f"  Пол по X: {'мужской' if male else 'женский'} "
+                          f"(гетерозиготность nonPAR X {x_het_pct:.2f}% "
+                          f"по {x_calls} позициям)")
+                else:
+                    print("  Пол по X не определён: нет калиброванных "
+                          "позиций nonPAR X")
+                pipeline.save_run_info(
+                    output_dir, sex_by_x="male" if male else "female",
+                    x_het_pct=round(x_het_pct, 3), x_nonpar_calls=x_calls,
+                )
                 pipeline.build_vcf(result, sample_vcf, sample_name="genotek",
                                    bgzip_path=pipeline.HTSLIB.bgzip_path,
-                                   chrom_prefix=panel_cfg["chrom_prefix"])
+                                   chrom_prefix=panel_cfg["chrom_prefix"],
+                                   haploid_x=male,
+                                   genome_build=panel_cfg["genome_build"])
                 self.after(0, self._set_subprogress, 2, 0.7, "Индексация...")
                 pipeline._index_vcf(sample_vcf)
                 self.after(0, self._set_subprogress, 2, 1.0, "VCF готов")
@@ -3910,7 +3949,8 @@ class App(ctk.CTk):
                 self.after(0, self._set_subprogress, 3, 1.0, "Доноры готовы")
 
                 # --- Этап 4: Concat -----------------------------------------
-                self.after(0, self._set_subprogress, 4, 0.0, "Объединение 22 доноров...")
+                self.after(0, self._set_subprogress, 4, 0.0,
+                           f"Объединение доноров ({len(donor_vcfs)} хромосом)...")
                 kgp_all = output_dir / "kgp_all.vcf.gz"
                 pipeline._concat_donors(donor_vcfs, kgp_all)
                 self.after(0, self._set_subprogress, 4, 1.0, "Готово")
@@ -3992,7 +4032,7 @@ class App(ctk.CTk):
                         f"1000 Genomes — сервер (Michigan Imputation Server / BioData "
                         f"Catalyst) гарантированно провалит QC ('Invalid Alleles', "
                         f"'SNPs call rate < 90%', 'No chunks passed the QC step'). "
-                        f"Запуск остановлен до создания 22 файлов для загрузки, чтобы "
+                        f"Запуск остановлен до создания 23 файлов для загрузки, чтобы "
                         f"не тратить время на заведомо провальное задание."
                     ) from e
 
@@ -4000,13 +4040,14 @@ class App(ctk.CTk):
                 upload_dir = output_dir / "upload"
                 outputs = pipeline.split_autosomes(merged, upload_dir,
                                                    bgzip_path=pipeline.HTSLIB.bgzip_path,
-                                                   chrom_prefix=panel_cfg["chrom_prefix"])
+                                                   chrom_prefix=panel_cfg["chrom_prefix"],
+                                                   genome_build=panel_cfg["genome_build"])
                 print(f"Создано {len(outputs)} файлов в {upload_dir}")
-                self.after(0, self._set_subprogress, 6, 1.0, "22 файла готовы")
+                self.after(0, self._set_subprogress, 6, 1.0, "23 файла готовы")
 
                 self.after(0, self._log_success, "=" * 60)
                 self.after(0, self._log_success, "✅ Этапы 1-6 завершены!")
-                self.after(0, self._log_success, f"📂 Загрузите 22 файла из: {upload_dir}")
+                self.after(0, self._log_success, f"📂 Загрузите 23 файла из: {upload_dir}")
                 self.after(0, self._log_success, f"📁 Папка запуска: {output_dir}")
                 self.after(0, self._log_success, "=" * 60)
 

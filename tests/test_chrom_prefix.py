@@ -145,6 +145,9 @@ def test_split_autosomes_default_no_prefix(tmp_path, _bgzip_writer_available):
     _write_plain_merged_vcf(merged, {
         "1": ["1\t100\trs1\tA\tG\t.\tPASS\t.\tGT\t0/1"],
         "2": ["2\t200\trs2\tC\t.\t.\tPASS\t.\tGT\t0/0"],
+        # X теперь тоже уходит на сервер импутации (промт "Покрытие
+        # X-хромосомы") — раньше эти строки молча выбрасывались.
+        "X": ["X\t300\trsX\tG\tA\t.\tPASS\t.\tGT\t1"],
     })
     output_dir = tmp_path / "upload"
     outputs = split_autosomes(merged, output_dir)
@@ -153,7 +156,11 @@ def test_split_autosomes_default_no_prefix(tmp_path, _bgzip_writer_available):
     assert chr1_lines == ["1\t100\trs1\tA\tG\t.\tPASS\t.\tGT\t0/1"]
     chr2_lines = _read_bgzf_or_gzip_lines(output_dir / "chr2.vcf.gz")
     assert chr2_lines == ["2\t200\trs2\tC\t.\t.\tPASS\t.\tGT\t0/0"]
-    assert len(outputs) == 22
+    chrx_lines = _read_bgzf_or_gzip_lines(output_dir / "chrX.vcf.gz")
+    assert chrx_lines == ["X\t300\trsX\tG\tA\t.\tPASS\t.\tGT\t1"], (
+        "Гаплоидный мужской X должен попадать в upload/chrX.vcf.gz как есть"
+    )
+    assert len(outputs) == 23  # 1-22 + X
 
 
 def test_split_autosomes_with_chr_prefix(tmp_path, _bgzip_writer_available):

@@ -435,7 +435,59 @@ def _mirrors_for_build(genome_build: str) -> list[str]:
         )
 
 
-def _vcf_suffix_candidates_for_build(genome_build: str) -> list[str]:
+# ---------------------------------------------------------------------------
+# Промт "Покрытие X-хромосомы" (жалоба Генотека: ~30% пропусков на X):
+# X-хромосома у 1000 Genomes phase3 (GRCh37) названа ПО ДРУГОМУ шаблону
+# суффикса, чем аутосомы: "…integrated_v1c.20130502…" вместо
+# "…integrated_v5a/v5b.20130502…" (v1b — устаревшая версия того же файла,
+# оставлена вторым кандидатом на случай зеркала со старым релизом).
+# Поэтому обычный перебор VCF_SUFFIX_CANDIDATES для chrom="X" не находит
+# файл ни на одном зеркале, и без отдельной таблицы доноры для X просто
+# не качаются.
+#
+# Для GRCh38-релиза (20190312_biallelic_SNV_and_INDEL) chrX следует
+# общему шаблону — отдельных кандидатов не требуется.
+X_VCF_SUFFIX_CANDIDATES_BY_BUILD: dict[str, list[str]] = {
+    "grch37": ["v1c", "v1b"],
+    "grch38": GRCH38_VCF_SUFFIX_CANDIDATES,
+}
+
+# Хромосомы, которые обрабатывает пайплайн доноров. X добавлена вместе с
+# поддержкой импутации X (см. X_VCF_SUFFIX_CANDIDATES_BY_BUILD выше);
+# Y и MT сознательно НЕ добавлены — их нет ни в HRC r1.1, ни в 1000G
+# Phase 3 как импутируемых панелей на Michigan Imputation Server.
+DONOR_CHROMS: list = [*range(1, 23), "X"]
+
+
+def is_x_chrom(chrom) -> bool:
+    """chrom здесь может быть int (1..22) или строкой ("X") — единая
+    проверка, чтобы не размазывать сравнения со строкой по модулю."""
+    return str(chrom).upper().replace("CHR", "") == "X"
+
+
+def chrom_sort_key(chrom) -> tuple[int, str]:
+    """Сортировка списка хромосом, в котором есть и int, и "X"
+    (sorted() на смешанном списке падает с TypeError)."""
+    return (99, str(chrom)) if is_x_chrom(chrom) else (int(chrom), "")
+
+
+def _suffix_cache_key(mirror: str, chrom) -> str:
+    """Ключ кэша "рабочий суффикс имени файла на этом зеркале".
+
+    ⚠ Кэш общий на весь прогон и раньше состоял только из имени зеркала.
+    Для X это неверно: рабочий суффикс аутосом (v5a/v5b) для chrX не
+    существует, и наоборот — закэшированное значение соседней хромосомы
+    увело бы перебор на заведомо несуществующий URL. Поэтому у X свой
+    ключ; для аутосом ключ не изменился (обратная совместимость).
+    """
+    return f"{mirror}#X" if is_x_chrom(chrom) else mirror
+
+
+def _vcf_suffix_candidates_for_build(genome_build: str, chrom=None) -> list[str]:
+    if chrom is not None and is_x_chrom(chrom):
+        return X_VCF_SUFFIX_CANDIDATES_BY_BUILD.get(
+            genome_build, X_VCF_SUFFIX_CANDIDATES_BY_BUILD["grch37"],
+        )
     return VCF_SUFFIX_CANDIDATES_BY_BUILD.get(genome_build, VCF_SUFFIX_CANDIDATES)
 
 
@@ -558,7 +610,11 @@ DEFAULT_PARALLEL_CHROMOSOMES = 3
 # remote_skip_large_chroms= (например, DEFAULT_REMOTE_SKIP_LARGE_CHROMS
 # из v18: {1..11, 14..18}), а чтобы принудительно пробовать remote для
 # всех хромосом как в v13 — передайте None/пустое множество.
-DEFAULT_REMOTE_SKIP_LARGE_CHROMS: Set[int] = set(range(1, 23))
+# X добавлена вместе с поддержкой импутации X-хромосомы: по той же
+# причине, что и аутосомы (см. выше) — remote-путь для полноразмерных
+# файлов 1000 Genomes систематически проваливается, полное скачивание
+# надёжнее.
+DEFAULT_REMOTE_SKIP_LARGE_CHROMS: set = {*range(1, 23), "X"}
 
 # Файлы, привязанные к конкретному чипу/сигнатуре — удаляются целиком
 # при обнаружении несовпадения chip_signature.txt (Задача 1, п.7).
@@ -1405,7 +1461,7 @@ def _raw_cache_has_chrom(raw_cache_dir: Path, chrom: int, genome_build: str = DE
     """
     raw_cache_dir = Path(raw_cache_dir)
     template = _vcf_template_for_build(genome_build)
-    for suffix in _vcf_suffix_candidates_for_build(genome_build):
+    for suffix in _vcf_suffix_candidates_for_build(genome_build, chrom):
         cached_vcf = raw_cache_dir / template.format(chrom=chrom, suffix=suffix)
         cached_tbi = cached_vcf.with_suffix(cached_vcf.suffix + ".tbi")
         if cached_vcf.exists() and cached_tbi.exists() and verify_file_fast(cached_vcf) and verify_file_fast(cached_tbi):
@@ -1440,7 +1496,7 @@ def _load_from_raw_cache(
     пропускается, поведение как раньше.
     """
     template = _vcf_template_for_build(genome_build)
-    for suffix in _vcf_suffix_candidates_for_build(genome_build):
+    for suffix in _vcf_suffix_candidates_for_build(genome_build, chrom):
         cached_vcf = raw_cache_dir / template.format(chrom=chrom, suffix=suffix)
         cached_tbi = cached_vcf.with_suffix(cached_vcf.suffix + ".tbi")
         if cached_vcf.exists() and cached_tbi.exists() and verify_file_fast(cached_vcf) and verify_file_fast(cached_tbi):
@@ -1567,7 +1623,7 @@ def download_chromosome_vcf(
     # зависит от зеркала — достаточно перенести его один раз на весь
     # вызов функции.
     if dest.exists() and dest.stat().st_size > 0:
-        likely_suffix = _vcf_suffix_candidates_for_build(genome_build)[-1]
+        likely_suffix = _vcf_suffix_candidates_for_build(genome_build, chrom)[-1]
         migrated_dest = _suffix_temp_path(dest, likely_suffix)
         if not migrated_dest.exists():
             print(
@@ -1607,14 +1663,17 @@ def download_chromosome_vcf(
 
     build_mirrors = _mirrors_for_build(genome_build)
     build_template = _vcf_template_for_build(genome_build)
-    build_suffix_candidates = _vcf_suffix_candidates_for_build(genome_build)
+    build_suffix_candidates = _vcf_suffix_candidates_for_build(genome_build, chrom)
 
     for mirror in build_mirrors:
         if cancel_check and cancel_check():
             raise DownloadCancelled("Скачивание отменено пользователем")
 
         mirror_name = mirror.split('/')[2]
-        known_suffix = working_suffix_by_mirror.get(mirror)
+        # Ключ кэша суффикса теперь зависит и от хромосомы — см.
+        # _suffix_cache_key() (у chrX свой шаблон имени файла).
+        suffix_key = _suffix_cache_key(mirror, chrom)
+        known_suffix = working_suffix_by_mirror.get(suffix_key)
         suffixes_to_try = [known_suffix] if known_suffix else build_suffix_candidates
 
         for suffix in suffixes_to_try:
@@ -1642,7 +1701,7 @@ def download_chromosome_vcf(
                         print(f"  ✓ {dest.name} и индекс скачаны (суффикс {suffix})")
                         suffix_dest.rename(dest)
                         suffix_tbi_dest.rename(tbi_dest)
-                        working_suffix_by_mirror[mirror] = suffix
+                        working_suffix_by_mirror[suffix_key] = suffix
                         if raw_cache_dir is not None:
                             _store_in_raw_cache(raw_cache_dir, chrom, suffix, dest, tbi_dest, genome_build=genome_build)
                         return True
@@ -1658,7 +1717,7 @@ def download_chromosome_vcf(
                                 print(f"  ✓ Индекс создан локально")
                                 suffix_dest.rename(dest)
                                 suffix_tbi_dest.rename(tbi_dest)
-                                working_suffix_by_mirror[mirror] = suffix
+                                working_suffix_by_mirror[suffix_key] = suffix
                                 if raw_cache_dir is not None:
                                     _store_in_raw_cache(raw_cache_dir, chrom, suffix, dest, tbi_dest, genome_build=genome_build)
                                 return True
@@ -2441,14 +2500,17 @@ def process_chromosome_remote(
     remote_attempt_started = time.monotonic()
     build_mirrors = _mirrors_for_build(genome_build)
     build_template = _vcf_template_for_build(genome_build)
-    build_suffix_candidates = _vcf_suffix_candidates_for_build(genome_build)
+    build_suffix_candidates = _vcf_suffix_candidates_for_build(genome_build, chrom)
     try:
         for mirror in build_mirrors:
             if cancel_check and cancel_check():
                 raise DownloadCancelled("Скачивание отменено пользователем")
 
             mirror_name = mirror.split('/')[2]
-            known_suffix = working_suffix_by_mirror.get(mirror)
+            # Ключ кэша суффикса зависит и от хромосомы — см.
+            # _suffix_cache_key() (у chrX свой шаблон имени файла).
+            suffix_key = _suffix_cache_key(mirror, chrom)
+            known_suffix = working_suffix_by_mirror.get(suffix_key)
             suffixes_to_try = [known_suffix] if known_suffix else build_suffix_candidates
 
             for suffix in suffixes_to_try:
@@ -2520,7 +2582,7 @@ def process_chromosome_remote(
                         out_file.with_suffix(out_file.suffix + ".tbi").unlink(missing_ok=True)
                         continue
 
-                    working_suffix_by_mirror[mirror] = suffix
+                    working_suffix_by_mirror[suffix_key] = suffix
                     ok = True
                     break
                 else:
@@ -2703,7 +2765,7 @@ def _invalidate_stale_donor_cache(
     if progress_cb:
         progress_cb(0.0, "Обнаружен кэш другого чипа — очистка...")
 
-    for chrom in range(1, 23):
+    for chrom in DONOR_CHROMS:
         (output_dir / f"kgp_sub_{chrom}.vcf.gz").unlink(missing_ok=True)
         (output_dir / f"kgp_sub_{chrom}.vcf.gz.tbi").unlink(missing_ok=True)
     for name in _SIGNATURE_SCOPED_STATIC_FILES:
@@ -2728,7 +2790,7 @@ def download_donors_for_chip(
     cancel_check: Optional[Callable[[], bool]] = None,
     remote_filter: bool = True,
     max_parallel_chromosomes: int = DEFAULT_PARALLEL_CHROMOSOMES,
-    remote_skip_large_chroms: Optional[Set[int]] = DEFAULT_REMOTE_SKIP_LARGE_CHROMS,
+    remote_skip_large_chroms: Optional[set] = DEFAULT_REMOTE_SKIP_LARGE_CHROMS,
     raw_cache_dir: Optional[Path] = None,
     bcftools_threads: Optional[int] = None,
     genome_build: str = DEFAULT_GENOME_BUILD,
@@ -2818,7 +2880,7 @@ def download_donors_for_chip(
     max_parallel_chromosomes: int = DEFAULT_PARALLEL_CHROMOSOMES (Часть 1.3) —
         сколько хромосом обрабатывать одновременно. 1 — старое строго
         последовательное поведение v11.
-    remote_skip_large_chroms: Optional[Set[int]] = DEFAULT_REMOTE_SKIP_LARGE_CHROMS
+    remote_skip_large_chroms: Optional[set] = DEFAULT_REMOTE_SKIP_LARGE_CHROMS
         (v14, Шаг 2 промта "точечный патч remote-фильтрации для крупных
         хромосом") — номера хромосом, для которых remote-путь пропускается
         вовсе и сразу используется полное скачивание. По умолчанию
@@ -2919,8 +2981,8 @@ def download_donors_for_chip(
     # раз", а не источник истины), но пишем под тем же лock'ом для
     # предсказуемости и чтобы не полагаться на детали GIL.
     working_suffix_by_mirror: dict[str, str] = {}
-    outputs_by_chrom: dict[int, Path] = {}
-    failed_chroms: list[int] = []
+    outputs_by_chrom: dict = {}
+    failed_chroms: list = []
     completed_count = 0
     progress_lock = threading.Lock()
     cancelled_flag = threading.Event()
@@ -2942,11 +3004,11 @@ def download_donors_for_chip(
         f"(ядер CPU: {os.cpu_count() or '?'}, параллельно хромосом: {max_workers})"
     )
 
-    skip_set: Set[int] = set(remote_skip_large_chroms) if remote_skip_large_chroms else set()
+    skip_set: set = set(remote_skip_large_chroms) if remote_skip_large_chroms else set()
     if remote_capable and skip_set:
         print(
             f"ℹ Remote-путь по умолчанию пропущен для хромосом "
-            f"{sorted(skip_set)} (v14, см. DEFAULT_REMOTE_SKIP_LARGE_CHROMS) — "
+            f"{sorted(skip_set, key=chrom_sort_key)} (v14, см. DEFAULT_REMOTE_SKIP_LARGE_CHROMS) — "
             f"для них сразу используется полное скачивание."
         )
     if raw_cache_dir is not None:
@@ -2958,12 +3020,12 @@ def download_donors_for_chip(
             f"источниками/чипами этой референсной сборки."
         )
     print(
-        f"\n[3/3] Обработка хромосом 1-22 (сборка: {genome_build}, "
+        f"\n[3/3] Обработка хромосом 1-22+X (сборка: {genome_build}, "
         f"{'удалённая фильтрация + ' if remote_capable else 'полное скачивание, '}"
         f"до {max_workers} хромосом(ы) параллельно)..."
     )
 
-    def _worker(chrom: int) -> bool:
+    def _worker(chrom) -> bool:
         if cancelled_flag.is_set() or (cancel_check and cancel_check()):
             raise DownloadCancelled("Скачивание отменено пользователем")
         with progress_lock:
@@ -2978,7 +3040,7 @@ def download_donors_for_chip(
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_chrom = {executor.submit(_worker, c): c for c in range(1, 23)}
+        future_to_chrom = {executor.submit(_worker, c): c for c in DONOR_CHROMS}
         try:
             for future in concurrent.futures.as_completed(future_to_chrom):
                 chrom = future_to_chrom[future]
@@ -2996,7 +3058,8 @@ def download_donors_for_chip(
                 with progress_lock:
                     completed_count += 1
                     n = completed_count
-                _cb(0.05 + 0.9 * n / 22, f"Обработано хромосом: {n}/22")
+                _cb(0.05 + 0.9 * n / len(DONOR_CHROMS),
+                    f"Обработано хромосом: {n}/{len(DONOR_CHROMS)}")
         except DownloadCancelled:
             # Ещё не запущенные задачи снимаем из очереди; уже запущенные
             # сами быстро завершатся (проверяют cancelled_flag/cancel_check
@@ -3006,12 +3069,13 @@ def download_donors_for_chip(
                 f.cancel()
             raise DownloadCancelled("Скачивание отменено пользователем")
 
-    outputs = [outputs_by_chrom[c] for c in sorted(outputs_by_chrom)]
+    outputs = [outputs_by_chrom[c] for c in sorted(outputs_by_chrom, key=chrom_sort_key)]
 
     if failed_chroms:
         raise RuntimeError(
-            f"Не удалось скачать/отфильтровать {len(failed_chroms)} из 22 "
-            f"хромосом: {', '.join(str(c) for c in sorted(failed_chroms))}. "
+            f"Не удалось скачать/отфильтровать {len(failed_chroms)} из "
+            f"{len(DONOR_CHROMS)} хромосом: "
+            f"{', '.join(str(c) for c in sorted(failed_chroms, key=chrom_sort_key))}. "
             f"Уже готовые хромосомы сохранены — повторный вызов их не "
             f"перекачает (докачка с места обрыва)."
         )
@@ -3030,7 +3094,7 @@ def download_donors_for_chip(
         _cb(1.0, "Доноры скачаны (без сигнатуры)")
 
     print("=" * 70)
-    print(f"ГОТОВО: 22/22 хромосом обработано")
+    print(f"ГОТОВО: {len(outputs)}/{len(DONOR_CHROMS)} хромосом обработано")
     print("=" * 70)
     return outputs
 
@@ -3078,11 +3142,11 @@ def main():
     )
     parser.add_argument(
         "--remote-skip-chroms", type=str,
-        default=",".join(str(c) for c in sorted(DEFAULT_REMOTE_SKIP_LARGE_CHROMS)),
+        default=",".join(str(c) for c in sorted(DEFAULT_REMOTE_SKIP_LARGE_CHROMS, key=chrom_sort_key)),
         help="v14: список номеров хромосом через запятую, для которых "
              "remote-путь (Часть 1.1) пропускается сразу — используется "
              "полное скачивание без бесполезного перебора зеркал/суффиксов. "
-             f"По умолчанию: {','.join(str(c) for c in sorted(DEFAULT_REMOTE_SKIP_LARGE_CHROMS))} "
+             f"По умолчанию: {','.join(str(c) for c in sorted(DEFAULT_REMOTE_SKIP_LARGE_CHROMS, key=chrom_sort_key))} "
              "(подтверждено/экстраполировано по реальному прогону, см. "
              "DEFAULT_REMOTE_SKIP_LARGE_CHROMS в коде). Передайте пустую "
              "строку '', чтобы пробовать remote-путь для всех хромосом, "
@@ -3176,7 +3240,9 @@ def main():
         # v14: пустая строка -> set() (пробовать remote для всех хромосом,
         # поведение v13); непустая строка -> набор номеров хромосом.
         remote_skip_chroms = {
-            int(x) for x in args.remote_skip_chroms.split(",") if x.strip()
+            ("X" if is_x_chrom(tok) else int(tok))
+            for tok in (t.strip() for t in args.remote_skip_chroms.split(","))
+            if tok
         } if args.remote_skip_chroms.strip() else set()
 
         try:
@@ -3221,10 +3287,10 @@ def main():
         if args.remote_filter else False
     )
     working_suffix_by_mirror: dict[str, str] = {}
-    print(f"\n[3/3] Обработка хромосом 1-22 (сборка: {args.genome_build})...")
+    print(f"\n[3/3] Обработка хромосом 1-22+X (сборка: {args.genome_build})...")
     success = 0
     failed_chroms = []
-    for chrom in range(1, 23):
+    for chrom in DONOR_CHROMS:
         if process_chromosome_auto(chrom, eur_set, chip_positions, output_dir,
                                     htslib, working_suffix_by_mirror, remote_capable,
                                     genome_build=args.genome_build):
@@ -3233,7 +3299,7 @@ def main():
             failed_chroms.append(chrom)
 
     print("\n" + "=" * 70)
-    print(f"ГОТОВО: {success}/22 хромосом обработано")
+    print(f"ГОТОВО: {success}/{len(DONOR_CHROMS)} хромосом обработано")
     if failed_chroms:
         print(f"✗ Не удалось: {', '.join(str(c) for c in failed_chroms)}")
         print("  Запустите скрипт ещё раз — готовые хромосомы будут пропущены.")

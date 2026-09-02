@@ -14,6 +14,7 @@ import zipfile
 from pathlib import Path
 from typing import Callable, Optional
 
+from core.pure_python_core import UPLOAD_CHROMS
 from core.archive_utils import (
     extract_zip, extract_all, find_7z, ArchiveExtractionError,
 )
@@ -66,7 +67,7 @@ class MISAdapter:
     Адаптер для взаимодействия с Michigan Imputation Server.
 
     Основные методы:
-    - prepare_upload_files(): разбивка merged VCF на 22 файла
+    - prepare_upload_files(): разбивка merged VCF на 23 файла (1-22 + X)
     - open_upload_page(): открытие страницы загрузки в браузере
     - download_results(): скачивание результатов по curl-ссылке
     - extract_all_results(): распаковка ВСЕХ ZIP-архивов результатов
@@ -105,16 +106,22 @@ class MISAdapter:
     def prepare_upload_files(
         self,
         merged_vcf: Path,
-        chromosomes: range = range(1, 23),
+        chromosomes=None,
     ) -> list[Path]:
         """
         Разбивает merged VCF на отдельные файлы по хромосомам.
 
         merged_vcf: путь к объединённому VCF (batch_merged.vcf.gz)
-        chromosomes: диапазон хромосом (по умолчанию 1-22)
+        chromosomes: перечень хромосом (по умолчанию UPLOAD_CHROMS —
+            1-22 + X). X добавлена вместе с поддержкой импутации
+            X-хромосомы: Michigan Imputation Server сам делит присланный
+            chrX.vcf.gz на PAR1/nonPAR/PAR2 и возвращает результат одним
+            файлом, отдельной подготовки с нашей стороны не требуется.
 
         Возвращает список созданных файлов.
         """
+        if chromosomes is None:
+            chromosomes = UPLOAD_CHROMS
         merged_vcf = Path(merged_vcf)
         if not merged_vcf.exists():
             raise MISAdapterError(f"VCF файл не найден: {merged_vcf}")
@@ -162,7 +169,7 @@ class MISAdapter:
         print("2. Нажмите 'Genotype Imputation' → 'RUN'")
         print("3. В поле 'Name' введите любое название (например: genotek)")
         print("4. В 'Reference Panel' выберите: HRC r1.1 2016 (GRCh37/hg19)")
-        print("5. Нажмите 'Select Files' и загрузите ВСЕ 22 файла из папки:")
+        print("5. Нажмите 'Select Files' и загрузите ВСЕ 23 файла (1-22 + X) из папки:")
         print(f"   {self.upload_dir.absolute()}")
         print("6. Поставьте галочки в необходимых параметрах")
         print("7. Нажмите 'Start Imputation'")
@@ -427,7 +434,7 @@ class MISAdapter:
         """Распаковывает ОДИН ZIP (оставлено для обратной совместимости).
         Для полного набора результатов MIS используйте extract_all_results()
         со списком из download_results() — иначе распакуется только одна
-        хромосома из 22."""
+        хромосома из 23 (1-22 + X)."""
         self._extract_one(Path(zip_path), password)
 
     def _extract_one(self, zip_path: Path, password: str) -> None:
@@ -442,8 +449,8 @@ class MISAdapter:
 
         Возвращает словарь с количеством файлов:
         {
-            "dose_vcf": 22,   # chr*.dose.vcf.gz
-            "info": 22,        # chr*.info.gz
+            "dose_vcf": 23,   # chr*.dose.vcf.gz (1-22 + X)
+            "info": 23,        # chr*.info.gz
         }
         """
         dose_files = list(self.results_dir.glob("chr*.dose.vcf.gz"))
@@ -454,14 +461,18 @@ class MISAdapter:
             "info": len(info_files),
         }
 
-        if len(dose_files) != 22 or len(info_files) != 22:
+        expected = len(UPLOAD_CHROMS)
+        if len(dose_files) != expected or len(info_files) != expected:
+            # Не ошибка: X может отсутствовать (задание было отправлено
+            # только с аутосомами, или панель/сервер не вернули X).
             logger.warning(
-                "Ожидается 22 файла каждого типа, найдено: dose=%d, info=%d",
-                len(dose_files),
-                len(info_files),
+                "Ожидается %d файла каждого типа (1-22 + X), найдено: "
+                "dose=%d, info=%d",
+                expected, len(dose_files), len(info_files),
             )
         else:
-            logger.info("Проверка результатов: OK (22 dose + 22 info)")
+            logger.info("Проверка результатов: OK (%d dose + %d info)",
+                        expected, expected)
 
         return result
 

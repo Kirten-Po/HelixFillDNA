@@ -89,162 +89,216 @@ def load_imputed_genotypes(
     chrom_names = [str(i) for i in range(1, 23)] + ["X", "Y", "MT"]
 
     for chrom in chrom_names:
-        vcf_path = imputed_dir / f"chr{chrom}.dose.vcf.gz"
-        info_path = imputed_dir / f"chr{chrom}.info.gz"
-
-        if not vcf_path.exists():
-            # Пропускаем без предупреждения — хромосомы Y/MT могут отсутствовать
-            continue
-
-        # 1. Загружаем Rsq для этой хромосомы
-        rsq_map: dict[tuple[str, int], float] = {}
-        if info_path.exists():
-            with gzip.open(info_path, "rt", encoding="utf-8") as f:
-                header = f.readline().rstrip("\n\r").split("\t")
-                lower = [x.lower() for x in header]
-                pos_idx = next((i for i, x in enumerate(lower) if x in {"position", "pos"}), None)
-                chr_idx = next((i for i, x in enumerate(lower) if x in {"chromosome", "chrom", "chr"}), None)
-                rsq_idx = next((i for i, x in enumerate(lower) if x == "rsq"), None)
-
-                if pos_idx is not None and chr_idx is not None and rsq_idx is not None:
-                    for line in f:
-                        if not line.strip():
-                            continue
-                        fields = line.rstrip("\n\r").split("\t")
-                        try:
-                            c = fields[chr_idx].replace("chr", "")
-                            p = int(fields[pos_idx])
-                            rsq_map[(c, p)] = float(fields[rsq_idx])
-                        except (ValueError, IndexError):
-                            continue
-
-        # 2. Индексируем VCF, если нужно
-        tbi_path = vcf_path.with_suffix(".vcf.gz.tbi")
-        if not tbi_path.exists():
-            tabix_result = subprocess.run(
-                [tabix, "-p", "vcf", str(vcf_path)], capture_output=True, text=True,
+        for vcf_path, info_path in _dose_file_pairs(imputed_dir, chrom):
+            _load_one_dose_file(
+                vcf_path, info_path, chrom, genotypes, panel_set,
+                rsq_threshold, bcftools, tabix, sample_name, imputed_dir,
             )
-            if tabix_result.returncode != 0:
-                # Раньше здесь стоял check=True без вывода stderr — до
-                # пользователя долетал только бесполезный
-                # "Command '[...]' returned non-zero exit status 1"
-                # без единого слова о РЕАЛЬНОЙ причине (файл не BGZF,
-                # повреждён/усечён, не отсортирован и т.п.), хотя tabix
-                # эту причину печатает в stderr. Теперь она попадает в
-                # текст исключения и видна в логе GUI/CLI.
-                raise AssemblyError(
-                    f"tabix не смог проиндексировать {vcf_path.name} "
-                    f"(код {tabix_result.returncode}):\n"
-                    f"{tabix_result.stderr.strip() or '(tabix не вывел никакого сообщения об ошибке)'}\n"
-                    f"Обычно это значит, что файл повреждён/усечён (неудачная "
-                    f"докачка/распаковка) или не является настоящим BGZF-"
-                    f"сжатым VCF. Попробуйте скачать результаты MIS заново "
-                    f"для этой хромосомы."
-                )
-
-        # 3. Извлекаем генотипы
-        cmd = [
-            bcftools, "query",
-            "-s", sample_name,
-            "-f", "%CHROM\t%POS\t%REF\t%ALT\t[%GT]\n",
-            str(vcf_path),
-        ]
-        if panel_set:
-            panel_file = imputed_dir / f"_panel_{chrom}.txt"
-            # Промт "встроить лифтовер HRC/TopMed в gui/app.py", точечный
-            # фикс (НЕ связанный с самим лифтовером координат — тот уже
-            # решает свою часть задачи, перенос ПОЗИЦИЙ; здесь отдельная,
-            # независимая проблема — ИМЕНОВАНИЕ контига).
-            #
-            # panel_pos приходит сюда с КАНОНИЧЕСКИМИ именами хромосом (без
-            # префикса "chr") — так их всегда отдают и
-            # template/skeleton.py::extract_skeleton() (GRCh37/HRC), и
-            # main.py::liftover_positions_forward()/
-            # core/liftover.py::ChainLiftover.lift() (после форвард-
-            # лифтовера под TopMed — ChainLiftover тоже всегда возвращает
-            # канонический вид). Но сам VCF-результат Michigan Imputation
-            # Server для сборок с REFERENCE_PANELS[panel]["chrom_prefix"]
-            # == "chr" (сейчас — TopMed/GRCh38, см. main.py) почти наверняка
-            # использует CHROM="chr1".."chr22" — то есть regions-файл с
-            # именами БЕЗ префикса не совпал бы ни с одной записью VCF, и
-            # bcftools view -R молча вернул бы 0 строк для каждой
-            # хромосомы: все импутированные генотипы для TopMed исчезли бы
-            # целиком, без единой ошибки.
-            #
-            # Фикс агностичен к лифтоверу и не требует знать о нём здесь:
-            # пишем в regions-файл ОБЕ формы имени хромосомы ("1" и "chr1").
-            # bcftools -R не требует, чтобы каждое имя контига в файле
-            # реально существовало в читаемом VCF — несовпавшие строки
-            # просто не находят совпадений и безвредны. Для HRC/GRCh37
-            # (где CHROM в самом VCF без "chr") совпадёт только форма без
-            # префикса — поведение не меняется, идемпотентно.
-            #
-            # ⚠ Не покрывает возможную путаницу "chrMT" vs "chrM" для
-            # митохондриальной хромосомы на некоторых GRCh38-релизах
-            # (иногда митохондрию называют "chrM", а не "chr" + "MT" =
-            # "chrMT") — это отдельный, неподтверждённый вопрос вне рамок
-            # этого точечного фикса.
-            # ⚠ Фикс (та же ловушка, что была найдена в
-            # main.py::_post_merge_intersect(), "Failed to read the
-            # regions"): без newline="" питоновский текстовый режим на
-            # Windows транслирует "\n" в "\r\n" при записи — regions-файл
-            # для bcftools -R получал CRLF-переносы на каждой строке. Это
-            # не всегда роняет bcftools с ошибкой (в отличие от
-            # common_pos.txt), но может тихо портить часть совпадений при
-            # чтении позиций — прямой риск для ЭТОГО файла особенно
-            # велик, так как он используется в bcftools query -R на Этапе
-            # 7 (загрузка импутированных генотипов) — если часть позиций
-            # молча не совпадёт, часть результата импутации попадёт в
-            # финальный файл как "--" вместо реального генотипа, без
-            # единой видимой ошибки.
-            with panel_file.open("w", newline="\n") as f:
-                for c, p in panel_set:
-                    if c == chrom:
-                        f.write(f"{c}\t{p}\n")
-                        f.write(f"chr{c}\t{p}\n")
-            cmd.extend(["-R", str(panel_file)])
-
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        for line in proc.stdout.splitlines():
-            if not line.strip():
-                continue
-            parts = line.split("\t")
-            if len(parts) < 5:
-                continue
-
-            c, p, ref, alt, gt = parts[0], parts[1], parts[2], parts[3], parts[4]
-            c_norm = c.replace("chr", "")
-            p_int = int(p)
-
-            # === ГЛАВНОЕ: ПРОВЕРКА Rsq ===
-            rsq = rsq_map.get((c_norm, p_int), 1.0)
-            if rsq < rsq_threshold:
-                continue  # Отбрасываем низкокачественные варианты
-
-            if "," in alt:
-                continue
-            if gt in ("./.", "."):
-                continue
-
-            gt_norm = gt.replace("|", "/")
-            alleles = gt_norm.split("/")
-            if len(alleles) != 2:
-                continue
-
-            try:
-                a1 = ref if alleles[0] == "0" else alt
-                a2 = ref if alleles[1] == "0" else alt
-                genotype = a1 + a2
-                key = f"{c_norm}_{p_int}"
-                genotypes[key] = genotype
-            except (IndexError, ValueError):
-                continue
-
-        if panel_set:
-            panel_file.unlink(missing_ok=True)
 
     logger.info("Загружено %d импутированных генотипов (Rsq >= %.2f)", len(genotypes), rsq_threshold)
     return genotypes
+
+
+# Michigan Imputation Server отдаёт X одним файлом chrX.dose.vcf.gz
+# (сервер сам склеивает PAR1/nonPAR/PAR2 обратно), но исторические версии
+# и часть зеркал отдают её тремя-четырьмя кусками с собственными именами
+# (chrX.no.auto_male / chrX.no.auto_female / chrX.par1 / chrX.par2).
+# Принимаем оба варианта: иначе результат импутации X, ради которого всё
+# и затевалось, молча не попал бы в финальный файл.
+_X_DOSE_GLOBS = ("chrX.*.dose.vcf.gz",)
+
+
+def _dose_file_pairs(imputed_dir: Path, chrom: str) -> list[tuple[Path, Path]]:
+    """Пары (dose.vcf.gz, info.gz) для одной хромосомы. Пустой список —
+    хромосомы нет в результатах (нормально для Y/MT и для X, если задание
+    отправлялось без неё)."""
+    pairs: list[tuple[Path, Path]] = []
+    main_vcf = imputed_dir / f"chr{chrom}.dose.vcf.gz"
+    if main_vcf.exists():
+        pairs.append((main_vcf, imputed_dir / f"chr{chrom}.info.gz"))
+    if chrom == "X":
+        for pattern in _X_DOSE_GLOBS:
+            for extra in sorted(imputed_dir.glob(pattern)):
+                if extra == main_vcf:
+                    continue
+                stem = extra.name[: -len(".dose.vcf.gz")]
+                pairs.append((extra, imputed_dir / f"{stem}.info.gz"))
+    return pairs
+
+
+def _load_one_dose_file(
+    vcf_path: Path,
+    info_path: Path,
+    chrom: str,
+    genotypes: dict[str, str],
+    panel_set,
+    rsq_threshold: float,
+    bcftools: str,
+    tabix: str,
+    sample_name: str,
+    imputed_dir: Path,
+) -> None:
+    """Тело прежнего цикла по хромосомам, вынесенное в отдельную функцию:
+    для X их теперь может быть несколько файлов на одну хромосому (см.
+    _dose_file_pairs())."""
+
+    # 1. Загружаем Rsq для этой хромосомы
+    rsq_map: dict[tuple[str, int], float] = {}
+    if info_path.exists():
+        with gzip.open(info_path, "rt", encoding="utf-8") as f:
+            header = f.readline().rstrip("\n\r").split("\t")
+            lower = [x.lower() for x in header]
+            pos_idx = next((i for i, x in enumerate(lower) if x in {"position", "pos"}), None)
+            chr_idx = next((i for i, x in enumerate(lower) if x in {"chromosome", "chrom", "chr"}), None)
+            rsq_idx = next((i for i, x in enumerate(lower) if x == "rsq"), None)
+
+            if pos_idx is not None and chr_idx is not None and rsq_idx is not None:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    fields = line.rstrip("\n\r").split("\t")
+                    try:
+                        c = fields[chr_idx].replace("chr", "")
+                        p = int(fields[pos_idx])
+                        rsq_map[(c, p)] = float(fields[rsq_idx])
+                    except (ValueError, IndexError):
+                        continue
+
+    # 2. Индексируем VCF, если нужно
+    tbi_path = vcf_path.with_suffix(".vcf.gz.tbi")
+    if not tbi_path.exists():
+        tabix_result = subprocess.run(
+            [tabix, "-p", "vcf", str(vcf_path)], capture_output=True, text=True,
+        )
+        if tabix_result.returncode != 0:
+            # Раньше здесь стоял check=True без вывода stderr — до
+            # пользователя долетал только бесполезный
+            # "Command '[...]' returned non-zero exit status 1"
+            # без единого слова о РЕАЛЬНОЙ причине (файл не BGZF,
+            # повреждён/усечён, не отсортирован и т.п.), хотя tabix
+            # эту причину печатает в stderr. Теперь она попадает в
+            # текст исключения и видна в логе GUI/CLI.
+            raise AssemblyError(
+                f"tabix не смог проиндексировать {vcf_path.name} "
+                f"(код {tabix_result.returncode}):\n"
+                f"{tabix_result.stderr.strip() or '(tabix не вывел никакого сообщения об ошибке)'}\n"
+                f"Обычно это значит, что файл повреждён/усечён (неудачная "
+                f"докачка/распаковка) или не является настоящим BGZF-"
+                f"сжатым VCF. Попробуйте скачать результаты MIS заново "
+                f"для этой хромосомы."
+            )
+
+    # 3. Извлекаем генотипы
+    cmd = [
+        bcftools, "query",
+        "-s", sample_name,
+        "-f", "%CHROM\t%POS\t%REF\t%ALT\t[%GT]\n",
+        str(vcf_path),
+    ]
+    if panel_set:
+        panel_file = imputed_dir / f"_panel_{chrom}.txt"
+        # Промт "встроить лифтовер HRC/TopMed в gui/app.py", точечный
+        # фикс (НЕ связанный с самим лифтовером координат — тот уже
+        # решает свою часть задачи, перенос ПОЗИЦИЙ; здесь отдельная,
+        # независимая проблема — ИМЕНОВАНИЕ контига).
+        #
+        # panel_pos приходит сюда с КАНОНИЧЕСКИМИ именами хромосом (без
+        # префикса "chr") — так их всегда отдают и
+        # template/skeleton.py::extract_skeleton() (GRCh37/HRC), и
+        # main.py::liftover_positions_forward()/
+        # core/liftover.py::ChainLiftover.lift() (после форвард-
+        # лифтовера под TopMed — ChainLiftover тоже всегда возвращает
+        # канонический вид). Но сам VCF-результат Michigan Imputation
+        # Server для сборок с REFERENCE_PANELS[panel]["chrom_prefix"]
+        # == "chr" (сейчас — TopMed/GRCh38, см. main.py) почти наверняка
+        # использует CHROM="chr1".."chr22" — то есть regions-файл с
+        # именами БЕЗ префикса не совпал бы ни с одной записью VCF, и
+        # bcftools view -R молча вернул бы 0 строк для каждой
+        # хромосомы: все импутированные генотипы для TopMed исчезли бы
+        # целиком, без единой ошибки.
+        #
+        # Фикс агностичен к лифтоверу и не требует знать о нём здесь:
+        # пишем в regions-файл ОБЕ формы имени хромосомы ("1" и "chr1").
+        # bcftools -R не требует, чтобы каждое имя контига в файле
+        # реально существовало в читаемом VCF — несовпавшие строки
+        # просто не находят совпадений и безвредны. Для HRC/GRCh37
+        # (где CHROM в самом VCF без "chr") совпадёт только форма без
+        # префикса — поведение не меняется, идемпотентно.
+        #
+        # ⚠ Не покрывает возможную путаницу "chrMT" vs "chrM" для
+        # митохондриальной хромосомы на некоторых GRCh38-релизах
+        # (иногда митохондрию называют "chrM", а не "chr" + "MT" =
+        # "chrMT") — это отдельный, неподтверждённый вопрос вне рамок
+        # этого точечного фикса.
+        # ⚠ Фикс (та же ловушка, что была найдена в
+        # main.py::_post_merge_intersect(), "Failed to read the
+        # regions"): без newline="" питоновский текстовый режим на
+        # Windows транслирует "\n" в "\r\n" при записи — regions-файл
+        # для bcftools -R получал CRLF-переносы на каждой строке. Это
+        # не всегда роняет bcftools с ошибкой (в отличие от
+        # common_pos.txt), но может тихо портить часть совпадений при
+        # чтении позиций — прямой риск для ЭТОГО файла особенно
+        # велик, так как он используется в bcftools query -R на Этапе
+        # 7 (загрузка импутированных генотипов) — если часть позиций
+        # молча не совпадёт, часть результата импутации попадёт в
+        # финальный файл как "--" вместо реального генотипа, без
+        # единой видимой ошибки.
+        with panel_file.open("w", newline="\n") as f:
+            for c, p in panel_set:
+                if c == chrom:
+                    f.write(f"{c}\t{p}\n")
+                    f.write(f"chr{c}\t{p}\n")
+        cmd.extend(["-R", str(panel_file)])
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 5:
+            continue
+
+        c, p, ref, alt, gt = parts[0], parts[1], parts[2], parts[3], parts[4]
+        c_norm = c.replace("chr", "")
+        p_int = int(p)
+
+        # === ГЛАВНОЕ: ПРОВЕРКА Rsq ===
+        rsq = rsq_map.get((c_norm, p_int), 1.0)
+        if rsq < rsq_threshold:
+            continue  # Отбрасываем низкокачественные варианты
+
+        if "," in alt:
+            continue
+        if gt in ("./.", "."):
+            continue
+
+        gt_norm = gt.replace("|", "/")
+        alleles = gt_norm.split("/")
+        # ГАПЛОИДНЫЙ вызов ("0" / "1") — нормальная и ожидаемая форма
+        # для мужского nonPAR X: именно так мы отправляем эти позиции
+        # на сервер (см. core/pure_python_core.py::build_vcf(haploid_x=))
+        # и так же их возвращает Michigan Imputation Server. Раньше
+        # здесь стояло жёсткое `len(alleles) != 2 → continue`, то есть
+        # весь мужской X был бы отброшен целиком и молча.
+        # В формат 23andMe v3 такой вызов записывается удвоенным
+        # (как и прямые измерения чипа на X, см. load_measured_genotypes)
+        # — так же, как это делал прежний файл, принятый Генотеком.
+        if len(alleles) == 1:
+            alleles = [alleles[0], alleles[0]]
+        elif len(alleles) != 2:
+            continue
+
+        try:
+            a1 = ref if alleles[0] == "0" else alt
+            a2 = ref if alleles[1] == "0" else alt
+            genotype = a1 + a2
+            key = f"{c_norm}_{p_int}"
+            genotypes[key] = genotype
+        except (IndexError, ValueError):
+            continue
+
+    if panel_set:
+        panel_file.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------

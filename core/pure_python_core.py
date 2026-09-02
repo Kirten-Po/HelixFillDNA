@@ -88,6 +88,71 @@ def _vcf_gt(gt: str) -> str:
     return gt.replace("|", "/")
 
 
+# ---------------------------------------------------------------------------
+# X-хромосома: псевдоаутосомные регионы и определение пола
+#
+# Промт "Покрытие X-хромосомы" (жалоба Генотека: ~30% пропусков на X).
+# Michigan Imputation Server делит присланный chrX на PAR1/nonPAR/PAR2 сам,
+# но требует, чтобы В ПРЕДЕЛАХ nonPAR у каждого образца была ОДНА плоидность
+# ("Ploidy Check: verifies if all variants in the nonPAR region are either
+# haploid or diploid"). Для мужчины биологически верный и ожидаемый сервером
+# вариант — гаплоидный nonPAR (GT "0"/"1"), в PAR — диплоидный, как у
+# аутосом. Именно так устроены и донорские мужские образцы 1000 Genomes,
+# с которыми наш sample.vcf.gz потом объединяется.
+#
+# Границы PAR берутся по сборке: чип FTDNA/23andMe помечает часть PAR как
+# отдельную "хромосому" XY, адаптеры сводят её к X (см. adapters/*.py
+# CHROM_MAP), поэтому опираться на исходную метку нельзя — только на
+# координату.
+PAR_REGIONS_BY_BUILD: dict[str, tuple[tuple[int, int], tuple[int, int]]] = {
+    # (PAR1_start, PAR1_end), (PAR2_start, PAR2_end) — включительно
+    "grch37": ((60001, 2699520), (154931044, 155260560)),
+    "grch38": ((10001, 2781479), (155701383, 156030895)),
+}
+
+# Доля гетерозиготных вызовов в nonPAR X, ниже которой образец считается
+# мужским. То же пороговое значение, что и в core/ancestry_convert.py
+# (MALE_X_HET_THRESHOLD_PCT) — у мужчин это чистый шум чипа (доли процента),
+# у женщин счёт идёт на десятки процентов, промежуточных значений на
+# практике не бывает.
+MALE_X_HET_THRESHOLD_PCT = 1.0
+# Меньше этого числа калиброванных позиций в nonPAR X — определять пол не по
+# чему (например, файл вообще без X): считаем образец женским, то есть
+# пишем X диплоидно. Это безопасный вариант по умолчанию: диплоидный nonPAR
+# сервер тоже принимает, просто импутирует его как женский.
+MIN_X_CALLS_FOR_SEX = 200
+
+
+def is_par_position(pos: int, genome_build: str = "grch37") -> bool:
+    """Попадает ли координата X в псевдоаутосомный регион этой сборки."""
+    par1, par2 = PAR_REGIONS_BY_BUILD.get(
+        genome_build, PAR_REGIONS_BY_BUILD["grch37"],
+    )
+    return par1[0] <= pos <= par1[1] or par2[0] <= pos <= par2[1]
+
+
+def infer_male_from_variants(variants, genome_build: str = "grch37") -> tuple[bool, float, int]:
+    """
+    Определяет пол по гетерозиготности nonPAR X.
+
+    Возвращает (male, het_pct, x_nonpar_calls). male=False при недостатке
+    данных (см. MIN_X_CALLS_FOR_SEX) — это осознанно безопасный вариант
+    по умолчанию, а не утверждение, что образец женский.
+    """
+    called = het = 0
+    for v in variants:
+        if _normalise_chrom(v.chrom) != "X":
+            continue
+        if is_par_position(int(v.pos), genome_build):
+            continue
+        called += 1
+        if _vcf_gt(v.gt) in ("0/1", "1/0"):
+            het += 1
+    het_pct = (100.0 * het / called) if called else 0.0
+    male = called >= MIN_X_CALLS_FOR_SEX and het_pct < MALE_X_HET_THRESHOLD_PCT
+    return male, het_pct, called
+
+
 def _chrom_sort_key(chrom: str) -> tuple[int, int]:
     """Ключ сортировки для хромосом: 1-22, X, Y, MT."""
     c = _normalise_chrom(chrom)
@@ -138,6 +203,8 @@ def build_vcf(
     compress: bool = True,
     bgzip_path: Optional[str] = None,
     chrom_prefix: str = "",
+    haploid_x: bool = False,
+    genome_build: str = "grch37",
 ) -> Path:
     """
     Записывает VCF из ParseResult.
@@ -157,6 +224,22 @@ def build_vcf(
     и валидация (validate_variants) по-прежнему работают с каноническим
     именем хромосомы (без префикса) через _normalise_chrom() — эта функция
     не трогается и не должна получать chrom_prefix.
+
+    haploid_x (промт "Покрытие X-хромосомы"): если True (мужской образец,
+    см. infer_male_from_variants()), позиции nonPAR X пишутся ГАПЛОИДНО
+    (GT "0"/"1") — этого ждёт Michigan Imputation Server от мужского X
+    (Ploidy Check), так же устроены донорские мужские образцы 1000
+    Genomes, и только так сервер импутирует X как мужской, а не выдаёт
+    биологически невозможные гетерозиготы. PAR остаётся диплоидным.
+
+    Редкие гетерозиготные вызовы в nonPAR X у мужчины (шум гибридизации
+    чипа — обычно единицы позиций из десятков тысяч) в гаплоидный GT не
+    переводятся однозначно и ОТБРАСЫВАЮТСЯ: оставить их диплоидными
+    нельзя (смешанная плоидность в nonPAR — прямой провал Ploidy Check и
+    отказ всего задания), а выбирать за чип один из двух аллелей —
+    выдумывать данные. Их число логируется.
+
+    genome_build определяет границы PAR (см. PAR_REGIONS_BY_BUILD).
     """
     validate_variants(result)
     output_vcf = Path(output_vcf)
@@ -167,11 +250,32 @@ def build_vcf(
         key=lambda v: (_chrom_sort_key(v.chrom), int(v.pos)),
     )
 
+    haploid_positions: set[int] = set()
+    if haploid_x:
+        dropped_het = 0
+        kept: list = []
+        for v in variants:
+            if (_normalise_chrom(v.chrom) == "X"
+                    and not is_par_position(int(v.pos), genome_build)):
+                if _vcf_gt(v.gt) in ("0/1", "1/0"):
+                    dropped_het += 1
+                    continue
+                haploid_positions.add(int(v.pos))
+            kept.append(v)
+        variants = kept
+        logger.info(
+            "X-хромосома: мужской образец — %d позиций nonPAR записаны "
+            "гаплоидно, %d гетерозиготных вызовов nonPAR отброшено "
+            "(шум чипа, см. докстринг build_vcf)",
+            len(haploid_positions), dropped_het,
+        )
+
     if not compress:
         with output_vcf.open("w", encoding="utf-8", newline="\n") as f:
             _write_vcf_header(f, sample_name)
             for v in variants:
-                _write_vcf_line(f, v, chrom_prefix=chrom_prefix)
+                _write_vcf_line(f, v, chrom_prefix=chrom_prefix,
+                                haploid_positions=haploid_positions)
         final_path = output_vcf
     elif bgzip_path:
         # Настоящий BGZF через внешний бинарник
@@ -179,7 +283,8 @@ def build_vcf(
         with tmp_vcf.open("w", encoding="utf-8", newline="\n") as f:
             _write_vcf_header(f, sample_name)
             for v in variants:
-                _write_vcf_line(f, v, chrom_prefix=chrom_prefix)
+                _write_vcf_line(f, v, chrom_prefix=chrom_prefix,
+                                haploid_positions=haploid_positions)
         result_proc = subprocess.run(
             [bgzip_path, "-f", str(tmp_vcf)],
             capture_output=True, text=True,
@@ -196,7 +301,8 @@ def build_vcf(
         with gzip.open(output_vcf, "wt", encoding="utf-8", newline="\n") as f:
             _write_vcf_header(f, sample_name)
             for v in variants:
-                _write_vcf_line(f, v, chrom_prefix=chrom_prefix)
+                _write_vcf_line(f, v, chrom_prefix=chrom_prefix,
+                                haploid_positions=haploid_positions)
         final_path = output_vcf
 
     logger.info("VCF собран: %d вариантов в %s (chrom_prefix=%r)",
@@ -211,16 +317,28 @@ def _write_vcf_header(f, sample_name: str) -> None:
     f.write(f"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{sample_name}\n")
 
 
-def _write_vcf_line(f, v: ParsedVariant, chrom_prefix: str = "") -> None:
+def _write_vcf_line(f, v: ParsedVariant, chrom_prefix: str = "",
+                    haploid_positions: Optional[set] = None) -> None:
     """
     chrom_prefix подставляется ЗДЕСЬ, в момент записи, и только здесь —
     v.chrom/_normalise_chrom() остаются каноническими (без префикса) везде
     в остальном модуле (сортировка, dict-ключи, валидация).
+
+    haploid_positions — координаты X, которые нужно записать гаплоидно
+    (мужской nonPAR, см. build_vcf(haploid_x=...)). Набор уже отфильтрован
+    вызывающим кодом по хромосоме, поэтому здесь достаточно сверки
+    "X + позиция в наборе".
     """
-    chrom = f"{chrom_prefix}{_normalise_chrom(v.chrom)}"
+    canonical = _normalise_chrom(v.chrom)
+    chrom = f"{chrom_prefix}{canonical}"
+    gt = _vcf_gt(v.gt)
+    if haploid_positions and canonical == "X" and int(v.pos) in haploid_positions:
+        # "0/0" -> "0", "1/1" -> "1"; гетерозиготы сюда не попадают —
+        # build_vcf() их отбрасывает до записи.
+        gt = gt.split("/")[0]
     f.write(
         f"{chrom}\t{int(v.pos)}\t{v.rsid}\t{v.ref}\t{v.alt}"
-        f"\t.\tPASS\t.\tGT\t{_vcf_gt(v.gt)}\n"
+        f"\t.\tPASS\t.\tGT\t{gt}\n"
     )
 
 
@@ -452,14 +570,147 @@ def _reprefix_chrom_field(line: str, chrom_prefix: str) -> str:
     return f"{chrom_prefix}{canonical}\t{parts[1]}"
 
 
+# Хромосомы, которые уходят на сервер импутации. X добавлена вместе с
+# поддержкой импутации X-хромосомы (жалоба Генотека на ~30% пропусков на
+# X): и HRC r1.1, и 1000G Phase 3 v5 на Michigan Imputation Server
+# поддерживают X, сервер сам делит присланный chrX.vcf.gz на PAR1/nonPAR/
+# PAR2, импутирует их независимо и возвращает одним файлом — от нас
+# требуется только НЕ выбрасывать X на этом шаге (раньше выбрасывалась:
+# by_chrom содержал только "1".."22", и все ~31 тыс. позиций X молча
+# исчезали между batch_merged.vcf.gz и upload/).
+#
+# Y и MT сюда не входят: этих хромосом нет ни в одной поддерживаемой
+# панели импутации, они попадают в финальный файл только как прямые
+# измерения чипа (если они есть в исходном файле).
+UPLOAD_CHROMS: list[str] = [str(i) for i in range(1, 23)] + ["X"]
+
+
+_MISSING_GT = {"./.", ".|.", ".", "./.|.", ""}
+
+
+def _sample_gt(field: str) -> str:
+    """GT — всегда первая подколонка поля образца (FORMAT=GT:... )."""
+    return field.split(":", 1)[0]
+
+
+def _replace_gt(field: str, new_gt: str) -> str:
+    parts = field.split(":", 1)
+    return new_gt if len(parts) == 1 else f"{new_gt}:{parts[1]}"
+
+
+def normalise_x_ploidy(lines: list[str], genome_build: str = "grch37") -> tuple[list[str], int]:
+    """
+    Приводит плоидность каждого образца в nonPAR X к его собственной
+    преобладающей плоидности. Возвращает (строки, число_исправленных_полей).
+
+    Зачем (найдено живым прогоном на Michigan Imputation Server, задание
+    провалилось на QC):
+
+        Error: ChrX nonPAR region includes ambiguous samples (haploid and
+        diploid positions). Imputation cannot be started!
+
+    Сервер считает ПРОПУСК "./." диплоидной записью. В нашем мужском
+    образце nonPAR писался гаплоидно (см. build_vcf(haploid_x=...)), но
+    `bcftools merge` подставлял "./." на позициях, которые есть у доноров
+    и отсутствуют на чипе — и этих 13 записей из 28 900 хватило, чтобы
+    весь образец стал "ambiguous" и задание было отвергнуто целиком.
+    Донорские образцы 1000 Genomes при этом безупречны: каждый либо
+    целиком гаплоиден (мужчина), либо целиком диплоиден (женщина).
+
+    Поэтому плоидность нормализуется ПОСЛЕ merge, на готовых строках, и
+    для КАЖДОГО образца отдельно — по факту его собственных вызовов, а не
+    по нашему предположению о его поле:
+      * преобладающая плоидность считается только по непропущенным GT;
+      * пропуск переписывается в ту же плоидность ("./." -> "." у
+        гаплоидного образца);
+      * гомозиготный диплоидный вызов у гаплоидного образца сжимается
+        ("0/0" -> "0");
+      * гетерозиготный вызов у гаплоидного образца гаплоидным быть не
+        может — становится пропуском "." (выбирать за прибор один из двух
+        аллелей значило бы выдумывать данные);
+      * гаплоидный вызов у диплоидного образца удваивается ("1" -> "1/1").
+    PAR не трогается вовсе: там две копии у всех, и проверка сервера на
+    него не распространяется.
+    """
+    data_idx = [i for i, line in enumerate(lines) if not line.startswith("#")]
+    if not data_idx:
+        return lines, 0
+
+    # --- проход 1: преобладающая плоидность каждого образца в nonPAR ---
+    hap_counts: dict[int, int] = {}
+    dip_counts: dict[int, int] = {}
+    for i in data_idx:
+        parts = lines[i].rstrip("\n").split("\t")
+        if len(parts) < 10:
+            continue
+        if is_par_position(int(parts[1]), genome_build):
+            continue
+        for col in range(9, len(parts)):
+            gt = _sample_gt(parts[col])
+            if gt in _MISSING_GT:
+                continue
+            if "/" in gt or "|" in gt:
+                dip_counts[col] = dip_counts.get(col, 0) + 1
+            else:
+                hap_counts[col] = hap_counts.get(col, 0) + 1
+
+    haploid_cols = {
+        col for col in set(hap_counts) | set(dip_counts)
+        if hap_counts.get(col, 0) > dip_counts.get(col, 0)
+    }
+    if not haploid_cols and not dip_counts:
+        return lines, 0
+
+    # --- проход 2: правка ---
+    fixed = 0
+    out = list(lines)
+    for i in data_idx:
+        raw = out[i]
+        newline_suffix = "\n" if raw.endswith("\n") else ""
+        parts = raw.rstrip("\n").split("\t")
+        if len(parts) < 10:
+            continue
+        if is_par_position(int(parts[1]), genome_build):
+            continue
+        changed = False
+        for col in range(9, len(parts)):
+            gt = _sample_gt(parts[col])
+            want_haploid = col in haploid_cols
+            new_gt = None
+            if want_haploid:
+                if gt in _MISSING_GT:
+                    if gt != ".":
+                        new_gt = "."
+                elif "/" in gt or "|" in gt:
+                    a, b = gt.replace("|", "/").split("/", 1)
+                    new_gt = a if a == b else "."
+            else:
+                if gt == ".":
+                    new_gt = "./."
+                elif gt not in _MISSING_GT and "/" not in gt and "|" not in gt:
+                    new_gt = f"{gt}/{gt}"
+            if new_gt is not None and new_gt != gt:
+                parts[col] = _replace_gt(parts[col], new_gt)
+                changed = True
+                fixed += 1
+        if changed:
+            out[i] = "\t".join(parts) + newline_suffix
+    return out, fixed
+
+
 def split_autosomes(
     merged_vcf: Path,
     output_dir: Path,
     bgzip_path: Optional[str] = None,
     chrom_prefix: str = "",
+    chroms: Optional[list[str]] = None,
+    genome_build: str = "grch37",
 ) -> list[Path]:
     """
-    Делит merged VCF на chr1..chr22.
+    Делит merged VCF на chr1..chr22 + chrX (см. UPLOAD_CHROMS).
+    Историческое имя функции (split_autosomes) сохранено ради обратной
+    совместимости с вызывающим кодом и тестами; chroms= позволяет сузить
+    набор явно (например, вернуть поведение "только аутосомы").
     Выходные файлы пишутся как настоящий BGZF — они загружаются на
     Michigan Imputation Server, который проверяет формат через tabix.
 
@@ -475,7 +726,8 @@ def split_autosomes(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    by_chrom: dict[str, list[str]] = {str(i): [] for i in range(1, 23)}
+    chrom_names = list(chroms) if chroms else list(UPLOAD_CHROMS)
+    by_chrom: dict[str, list[str]] = {c: [] for c in chrom_names}
     header_lines: list[str] = []
     opener = gzip.open if str(merged_vcf).endswith(".gz") else open
 
@@ -498,9 +750,21 @@ def split_autosomes(
                         line = _reprefix_chrom_field(line, chrom_prefix)
                     by_chrom[chrom].append(line)
 
+    # Плоидность мужского nonPAR X: сервер отвергает задание целиком,
+    # если у образца в nonPAR встречаются и гаплоидные, и диплоидные
+    # записи — а "./." от bcftools merge считается диплоидной. См.
+    # normalise_x_ploidy().
+    if "X" in by_chrom and by_chrom["X"]:
+        by_chrom["X"], fixed = normalise_x_ploidy(by_chrom["X"], genome_build)
+        if fixed:
+            logger.info(
+                "chrX: плоидность приведена к единой в пределах nonPAR — "
+                "исправлено %d полей образцов", fixed,
+            )
+
     outputs: list[Path] = []
-    for chrom in range(1, 23):
-        chrom_str = str(chrom)
+    for chrom_str in chrom_names:
+        chrom = chrom_str
         out_path = output_dir / f"chr{chrom}.vcf.gz"
 
         def _lines_for_chrom(h=header_lines, d=by_chrom[chrom_str]):

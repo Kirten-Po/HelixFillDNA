@@ -233,7 +233,10 @@ from adapters.ancestry_v2 import (
 from core.ancestry_convert import (
     prepare_ancestry_file, AncestryConvertError, CONVERTED_SUFFIX,
 )
-from core.pure_python_core import build_vcf, split_autosomes, PureCoreError, _chrom_sort_key
+from core.pure_python_core import (
+    build_vcf, split_autosomes, PureCoreError, _chrom_sort_key, UPLOAD_CHROMS,
+    infer_male_from_variants,
+)
 from core.archive_utils import sanitize_password_text
 from core.network_utils import ensure_network_ready
 from core.liftover import ChainLiftover, LiftoverError
@@ -1883,10 +1886,82 @@ def _count_vcf_records(vcf_path: Path) -> int:
         return -1
 
 
+def _donor_sample_order(vcf_path: Path) -> list[str]:
+    """Имена образцов из строки #CHROM донорского VCF, в порядке колонок."""
+    # errors="replace" — bcftools дописывает в заголовок команду вызова с
+    # полным путём к файлу; на Windows при не-ASCII символах в пути эта
+    # строка может оказаться не в UTF-8 (та же причина, что и в
+    # core/pure_python_core.py). Имена образцов всегда чистый ASCII.
+    opener = gzip.open if str(vcf_path).endswith(".gz") else open
+    with opener(vcf_path, "rt", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.startswith("#CHROM"):
+                return line.rstrip("\r\n").split("\t")[9:]
+            if not line.startswith("#"):
+                break
+    return []
+
+
+def _align_donor_sample_order(donor_vcfs: list[Path]) -> None:
+    """
+    Приводит порядок колонок образцов во всех донорских файлах к порядку
+    первого из них.
+
+    Зачем (промт "Покрытие X-хромосомы", найдено живым прогоном):
+    `bcftools concat` требует не только одинакового НАБОРА образцов во
+    всех файлах, но и одинакового ПОРЯДКА колонок, иначе падает с
+    "Different sample names in <файл>. Perhaps bcftools merge is what you
+    are looking for?". Релиз 1000 Genomes phase3 перечисляет образцы в
+    chrX в другом порядке, чем в аутосомах, и этот порядок доживает до
+    kgp_sub_X.vcf.gz — набор образцов при этом идентичен (проверено:
+    те же 20 из 20), различается только их расположение по колонкам.
+
+    Переупорядочивание идемпотентно и делается ОДИН РАЗ: результат
+    записывается обратно в кэш доноров, поэтому на следующих запусках
+    порядок уже совпадает и функция ничего не делает. Файл с ДРУГИМ
+    набором образцов (а не только порядком) не трогается — это признак
+    испорченного/чужого кэша, и пусть об этом честно скажет сам
+    bcftools concat, а не тихо "починит" эта функция.
+    """
+    if len(donor_vcfs) < 2:
+        return
+    reference_order = _donor_sample_order(donor_vcfs[0])
+    if not reference_order:
+        return
+    reference_set = set(reference_order)
+
+    for donor in donor_vcfs[1:]:
+        order = _donor_sample_order(donor)
+        if order == reference_order or set(order) != reference_set:
+            continue
+        logger.info(
+            "Донор %s перечисляет образцов в другом порядке, чем %s — "
+            "переупорядочиваю (иначе bcftools concat откажется объединять)",
+            donor.name, donor_vcfs[0].name,
+        )
+        order_file = donor.parent / f"_sample_order_{donor.stem}.txt"
+        reordered = donor.parent / f"{donor.name}.reordered.tmp.vcf.gz"
+        try:
+            with order_file.open("w", encoding="utf-8", newline="\n") as f:
+                for name in reference_order:
+                    f.write(name + "\n")
+            _run_bcftools([
+                "view", "-S", str(order_file), str(donor),
+                "-Oz", "-o", str(reordered),
+            ])
+            reordered.replace(donor)
+            _index_vcf(donor)
+            logger.info("Порядок образцов в %s приведён к общему", donor.name)
+        finally:
+            order_file.unlink(missing_ok=True)
+            reordered.unlink(missing_ok=True)
+
+
 def _concat_donors(donor_vcfs: list[Path], output_vcf: Path) -> Path:
-    """bcftools concat kgp_sub_{1..22}.vcf.gz -Oz -o kgp_all.vcf.gz + индекс."""
+    """bcftools concat kgp_sub_{1..22,X}.vcf.gz -Oz -o kgp_all.vcf.gz + индекс."""
     output_vcf = Path(output_vcf)
     output_vcf.parent.mkdir(parents=True, exist_ok=True)
+    _align_donor_sample_order(donor_vcfs)
     _run_bcftools(["concat", *[str(p) for p in donor_vcfs], "-Oz", "-o", str(output_vcf)])
     _index_vcf(output_vcf)
     logger.info("Доноры объединены: %d файлов -> %s", len(donor_vcfs), output_vcf)
@@ -2074,10 +2149,10 @@ def check_donor_cache(
 ) -> list[Path]:
     """
     Единая точка правды для CLI (main()) и GUI (_check_donors): проверяет,
-    что кэш доноров под donors_root/<source>/<panel>/ полон (22 файла) и
+    что кэш доноров под donors_root/<source>/<panel>/ полон (23 файла: 1-22 + X) и
     что его chip_signature.txt совпадает с chip_signature текущего запуска.
 
-    Возвращает список из 22 путей kgp_sub_{1..22}.vcf.gz при успехе.
+    Возвращает список путей kgp_sub_{1..22,X}.vcf.gz при успехе.
     Бросает RuntimeError с понятной инструкцией (--source, --panel,
     --donors-subdir) при отсутствии файлов или несовпадении сигнатуры —
     что и требуется по сценарию "сначала FTDNA, потом MyHeritage без
@@ -2092,7 +2167,11 @@ def check_donor_cache(
 
     donor_vcfs: list[Path] = []
     missing: list[Path] = []
-    for chrom in range(1, 23):
+    # UPLOAD_CHROMS = 1..22 + X: тот же список, что уходит на сервер
+    # импутации (core/pure_python_core.py) и что качает download_donors.py
+    # (DONOR_CHROMS). Здесь берём его из core, потому что main.py
+    # сознательно не импортирует download_donors.
+    for chrom in UPLOAD_CHROMS:
         f = donors_dir / f"kgp_sub_{chrom}.vcf.gz"
         if f.exists():
             donor_vcfs.append(f)
@@ -2122,10 +2201,30 @@ def check_donor_cache(
     )
 
     if missing or not sig_file.exists():
+        missing_names = ", ".join(f.name for f in missing[:5])
+        if len(missing) > 5:
+            missing_names += f" и ещё {len(missing) - 5}"
+        # Отдельная подсказка для самого частого случая после добавления
+        # X в пайплайн: кэш доноров, скачанный прежней версией, полон по
+        # аутосомам, и не хватает ровно kgp_sub_X.vcf.gz. Перекачивать
+        # всё заново не нужно — download_donors пропускает уже готовые
+        # хромосомы и дотянет только недостающие.
+        only_x_missing = (
+            len(missing) == 1 and missing[0].name == "kgp_sub_X.vcf.gz"
+            and sig_file.exists()
+        )
+        hint = (
+            "\nЭто ожидаемо для кэша доноров, скачанного до появления "
+            "поддержки X-хромосомы: не хватает только её. Уже скачанные "
+            "хромосомы повторно не качаются — дотянется одна X."
+            if only_x_missing else ""
+        )
+        what_missing = missing_names or "нет файла сигнатуры"
         raise RuntimeError(
             f"Донорские файлы для источника '{source}' (панель '{panel_key}') "
-            f"отсутствуют или ещё не скачаны ({len(missing)} из 22 отсутствует, "
-            f"папка: {donors_dir}).\nСначала запустите:\n{download_cmd}"
+            f"отсутствуют или ещё не скачаны ({len(missing)} из "
+            f"{len(UPLOAD_CHROMS)} отсутствует: {what_missing}, "
+            f"папка: {donors_dir}).{hint}\nСначала запустите:\n{download_cmd}"
         )
 
     cached = sig_file.read_text(encoding="utf-8").strip()
@@ -2147,7 +2246,7 @@ def check_donor_cache(
     # _count_vcf_records() там же) — то есть сигнатура совпадает, но сами
     # kgp_sub_*.vcf.gz могут быть пустыми (корректный заголовок, 0
     # записей) из-за оборванного в своё время сетевого соединения
-    # (VPN/прокси и т.п.). Полная проверка всех 22 файлов на каждый
+    # (VPN/прокси и т.п.). Полная проверка всех файлов на каждый
     # запуск была бы слишком дорогой — проверяем только пару файлов
     # (первый и последний в списке, обычно chr1 и chr22), этого
     # достаточно, чтобы поймать типичный случай "весь кэш скачался
@@ -2852,9 +2951,24 @@ def main() -> None:
     # контигов, что и GRCh38-референс/доноры (kgp_sub_*.vcf.gz качаются
     # download_donors.py с тем же префиксом через GENOME_BUILD_CHROM_PREFIX)
     # — иначе bcftools merge/concat не совпадёт по CHROM вообще.
+    # Промт "Покрытие X-хромосомы": пол определяется по гетерозиготности
+    # nonPAR X ДО записи VCF — от него зависит плоидность мужского X,
+    # которую Michigan Imputation Server проверяет отдельным Ploidy Check
+    # (см. build_vcf(haploid_x=...)).
+    male, x_het_pct, x_calls = infer_male_from_variants(
+        result.variants, genome_build=panel_cfg["genome_build"],
+    )
+    if x_calls:
+        print(f"  Пол по X: {'мужской' if male else 'женский'} "
+              f"(гетерозиготность nonPAR X {x_het_pct:.2f}% по {x_calls} позициям)")
+    else:
+        print("  Пол по X не определён: в файле нет калиброванных позиций nonPAR X")
+    save_run_info(output_dir, sex_by_x="male" if male else "female",
+                  x_het_pct=round(x_het_pct, 3), x_nonpar_calls=x_calls)
     build_vcf(
         result, sample_vcf, sample_name="genotek", bgzip_path=HTSLIB.bgzip_path,
         chrom_prefix=panel_cfg["chrom_prefix"],
+        haploid_x=male, genome_build=panel_cfg["genome_build"],
     )
     _index_vcf(sample_vcf)
 
@@ -2864,7 +2978,7 @@ def main() -> None:
     except RuntimeError as e:
         sys.exit(str(e))
 
-    print("[4/7] Объединение 22 доноров")
+    print(f"[4/7] Объединение доноров ({len(donor_vcfs)} хромосом)")
     kgp_all = output_dir / "kgp_all.vcf.gz"
     _concat_donors(donor_vcfs, kgp_all)
 
@@ -2922,6 +3036,7 @@ def main() -> None:
     outputs = split_autosomes(
         merged, upload_dir, bgzip_path=HTSLIB.bgzip_path,
         chrom_prefix=panel_cfg["chrom_prefix"],
+        genome_build=panel_cfg["genome_build"],
     )
     print(f"  Создано {len(outputs)} файлов в {upload_dir}")
     print("=" * 70)

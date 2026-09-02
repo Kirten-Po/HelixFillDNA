@@ -74,6 +74,15 @@ title: HelixFillDNA
   <p><small>Windows 10+, 64-бит. Установщик не требует прав администратора.</small></p>
 </div>
 
+<div style="max-width:720px; margin:0 auto 1.5rem; padding:0.9rem 1.2rem;
+            border-left:4px solid #2a7ae2; background:#f4f8fd; border-radius:0 6px 6px 0;">
+  <strong>Новое в 1.2.0: импутируется и X-хромосома.</strong> Раньше через
+  импутацию проходили только аутосомы (1-22), и около 30 % позиций X
+  оставались в итоговом файле пустыми. Теперь X отправляется на сервер
+  наравне с остальными хромосомами — с учётом пола образца и
+  псевдоаутосомных регионов.
+</div>
+
 <figure style="margin:1.5rem 0; text-align:center;">
   <img src="prep_simple.png" alt="Вкладка Подготовка в обычном режиме: источник данных и файл" style="max-width:100%; border-radius:8px;">
   <figcaption style="color:#777; font-size:0.9rem; margin-top:0.4rem;">
@@ -84,9 +93,9 @@ title: HelixFillDNA
 </figure>
 
 <figure style="margin:1.5rem 0; text-align:center;">
-  <img src="run_step1.png" alt="Шаг 1: подготовка 22 файлов для сервера импутации" style="max-width:100%; border-radius:8px;">
+  <img src="run_step1.png" alt="Шаг 1: подготовка 23 файлов для сервера импутации" style="max-width:100%; border-radius:8px;">
   <figcaption style="color:#777; font-size:0.9rem; margin-top:0.4rem;">
-    Шаг 1 — программа читает ваш файл, скачивает донорские хромосомы и готовит 22 файла
+    Шаг 1 — программа читает ваш файл, скачивает донорские хромосомы и готовит 23 файла
     для сервера импутации. По ходу видно, какая хромосома качается, сколько мегабайт уже
     на диске и с какой скоростью.
   </figcaption>
