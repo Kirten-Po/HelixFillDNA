@@ -1902,48 +1902,94 @@ def _donor_sample_order(vcf_path: Path) -> list[str]:
     return []
 
 
-def _align_donor_sample_order(donor_vcfs: list[Path]) -> None:
+MIN_DONOR_SAMPLES = 5
+
+
+def _align_donor_samples(donor_vcfs: list[Path]) -> None:
     """
-    Приводит порядок колонок образцов во всех донорских файлах к порядку
-    первого из них.
+    Приводит НАБОР и ПОРЯДОК образцов во всех донорских файлах к общему
+    виду. Вызывается перед `bcftools concat`.
 
-    Зачем (промт "Покрытие X-хромосомы", найдено живым прогоном):
-    `bcftools concat` требует не только одинакового НАБОРА образцов во
-    всех файлах, но и одинакового ПОРЯДКА колонок, иначе падает с
-    "Different sample names in <файл>. Perhaps bcftools merge is what you
-    are looking for?". Релиз 1000 Genomes phase3 перечисляет образцы в
-    chrX в другом порядке, чем в аутосомах, и этот порядок доживает до
-    kgp_sub_X.vcf.gz — набор образцов при этом идентичен (проверено:
-    те же 20 из 20), различается только их расположение по колонкам.
+    Зачем (обе причины найдены живыми прогонами):
 
-    Переупорядочивание идемпотентно и делается ОДИН РАЗ: результат
-    записывается обратно в кэш доноров, поэтому на следующих запусках
-    порядок уже совпадает и функция ничего не делает. Файл с ДРУГИМ
-    набором образцов (а не только порядком) не трогается — это признак
-    испорченного/чужого кэша, и пусть об этом честно скажет сам
-    bcftools concat, а не тихо "починит" эта функция.
+    1. `Different sample names in kgp_sub_X.vcf.gz` — concat требует не
+       только одинакового набора образцов, но и одинакового ПОРЯДКА
+       колонок, а релиз 1000 Genomes перечисляет образцы в chrX иначе,
+       чем в аутосомах, и этот порядок доживает до kgp_sub_X.vcf.gz.
+
+    2. `Different number of samples in kgp_sub_X.vcf.gz` — кэш доноров
+       не помнит, при каком значении «число донорских образцов»
+       (eur_sample_count) он собирался: chip_signature.txt описывает
+       ЧИП, а не размер донорской подвыборки. Кэш, собранный прежней
+       версией на 20 образцах, спокойно проходит проверку сигнатуры, а
+       новая хромосома дотягивается уже с текущим значением по умолчанию
+       (вся EUR-подвыборка, 503) — и файлы перестают стыковаться.
+       Добавление X просто вскрыло это расхождение, само по себе оно к X
+       отношения не имеет и повторится на любой доскачанной хромосоме.
+
+    Решение общее для обоих случаев: берём ПЕРЕСЕЧЕНИЕ наборов образцов
+    (в порядке первого донора) и приводим к нему все файлы, которые ему
+    не соответствуют. Пересечение, а не объединение: недостающие
+    генотипы взять неоткуда, а лишние образцы — всего лишь меньший
+    донорский фон. Результат пишется обратно в кэш доноров, поэтому
+    операция разовая: на следующих запусках расхождения уже нет.
+
+    Если хочется вернуть полную подвыборку (503 вместо 20), это делается
+    не здесь, а осознанной перекачкой доноров с нужным eur_sample_count —
+    молча качать 22 хромосомы заново эта функция не станет.
     """
     if len(donor_vcfs) < 2:
         return
-    reference_order = _donor_sample_order(donor_vcfs[0])
-    if not reference_order:
-        return
-    reference_set = set(reference_order)
 
-    for donor in donor_vcfs[1:]:
-        order = _donor_sample_order(donor)
-        if order == reference_order or set(order) != reference_set:
+    orders = {donor: _donor_sample_order(donor) for donor in donor_vcfs}
+    if not all(orders.values()):
+        return  # не смогли прочитать заголовок — пусть скажет сам bcftools
+
+    sets = [set(v) for v in orders.values()]
+    common = set.intersection(*sets)
+    # Порог применяется ТОЛЬКО когда наборы реально расходятся и
+    # пересечение что-то отрезает. Если все доноры согласованы, их число
+    # образцов — осознанный выбор пользователя (eur_sample_count), и не
+    # дело этой функции его оспаривать.
+    all_equal = all(st == sets[0] for st in sets[1:])
+    if not all_equal and len(common) < MIN_DONOR_SAMPLES:
+        sizes = ", ".join(
+            f"{d.name}: {len(o)}" for d, o in orders.items()
+        )
+        raise RuntimeError(
+            f"У донорских файлов слишком мало общих образцов "
+            f"({len(common)}, нужно минимум {MIN_DONOR_SAMPLES}). "
+            f"Размеры: {sizes}.\nПохоже, кэш доноров собран из разных "
+            f"скачиваний с несовместимыми настройками — удалите папку "
+            f"доноров этой панели и скачайте их заново."
+        )
+
+    target = [name for name in orders[donor_vcfs[0]] if name in common]
+
+    sizes = {len(o) for o in orders.values()}
+    if len(sizes) > 1:
+        logger.warning(
+            "Донорские файлы содержат разное число образцов (%s) — беру "
+            "пересечение: %d образцов. Обычно это значит, что часть "
+            "хромосом скачана при другом значении «число донорских "
+            "образцов»: chip_signature.txt его не запоминает. Чтобы "
+            "использовать полную подвыборку, перекачайте доноров целиком.",
+            sorted(sizes), len(target),
+        )
+
+    for donor in donor_vcfs:
+        if orders[donor] == target:
             continue
         logger.info(
-            "Донор %s перечисляет образцов в другом порядке, чем %s — "
-            "переупорядочиваю (иначе bcftools concat откажется объединять)",
-            donor.name, donor_vcfs[0].name,
+            "Донор %s: %d образцов в своём порядке — привожу к общему "
+            "виду (%d образцов), иначе bcftools concat откажется объединять",
+            donor.name, len(orders[donor]), len(target),
         )
         order_file = donor.parent / f"_sample_order_{donor.stem}.txt"
-        reordered = donor.parent / f"{donor.name}.reordered.tmp.vcf.gz"
+        reordered = donor.parent / f"{donor.name}.aligned.tmp.vcf.gz"
         try:
             with order_file.open("w", encoding="utf-8", newline="\n") as f:
-                for name in reference_order:
+                for name in target:
                     f.write(name + "\n")
             _run_bcftools([
                 "view", "-S", str(order_file), str(donor),
@@ -1951,7 +1997,7 @@ def _align_donor_sample_order(donor_vcfs: list[Path]) -> None:
             ])
             reordered.replace(donor)
             _index_vcf(donor)
-            logger.info("Порядок образцов в %s приведён к общему", donor.name)
+            logger.info("Донор %s приведён к общему набору образцов", donor.name)
         finally:
             order_file.unlink(missing_ok=True)
             reordered.unlink(missing_ok=True)
@@ -1961,7 +2007,7 @@ def _concat_donors(donor_vcfs: list[Path], output_vcf: Path) -> Path:
     """bcftools concat kgp_sub_{1..22,X}.vcf.gz -Oz -o kgp_all.vcf.gz + индекс."""
     output_vcf = Path(output_vcf)
     output_vcf.parent.mkdir(parents=True, exist_ok=True)
-    _align_donor_sample_order(donor_vcfs)
+    _align_donor_samples(donor_vcfs)
     _run_bcftools(["concat", *[str(p) for p in donor_vcfs], "-Oz", "-o", str(output_vcf)])
     _index_vcf(output_vcf)
     logger.info("Доноры объединены: %d файлов -> %s", len(donor_vcfs), output_vcf)

@@ -355,3 +355,127 @@ def test_autosomes_are_not_affected(tmp_path):
     with gzip.open(tmp_path / "upload" / "chr1.vcf.gz", "rt") as f:
         data = [l for l in f if not l.startswith("#")]
     assert data == ["1\t100\trs1\tA\tG\t.\tPASS\t.\tGT\t./.\n"]
+
+
+# ---------------------------------------------------------------------------
+# 6. Согласование образцов доноров перед bcftools concat
+# ---------------------------------------------------------------------------
+# Два живых падения на этом шаге:
+#   Different sample names in kgp_sub_X.vcf.gz    — порядок колонок
+#   Different number of samples in kgp_sub_X...   — размер подвыборки
+# Второе к X отношения не имеет: chip_signature.txt описывает ЧИП, а не
+# eur_sample_count, поэтому кэш, собранный на 20 образцах, проходит
+# проверку сигнатуры, а доскачанная хромосома приходит уже с текущим
+# значением по умолчанию (503). Добавление X просто вскрыло расхождение.
+def _fake_donor(tmp_path: Path, name: str, samples: list[str]) -> Path:
+    path = tmp_path / name
+    path.write_text(
+        "##fileformat=VCFv4.2\n"
+        + "\t".join(["#CHROM", "POS", "ID", "REF", "ALT", "QUAL",
+                     "FILTER", "INFO", "FORMAT", *samples]) + "\n",
+        encoding="utf-8", newline="\n",
+    )
+    return path
+
+
+def test_donor_sample_order_is_read(tmp_path):
+    import main as pipeline
+
+    donor = _fake_donor(tmp_path, "kgp_sub_1.vcf", ["HG1", "HG2"])
+    assert pipeline._donor_sample_order(donor) == ["HG1", "HG2"]
+
+
+def test_align_is_noop_when_donors_already_match(tmp_path, monkeypatch):
+    import main as pipeline
+
+    calls = []
+    monkeypatch.setattr(pipeline, "_run_bcftools", lambda args: calls.append(args))
+    donors = [
+        _fake_donor(tmp_path, "kgp_sub_1.vcf", ["HG1", "HG2"]),
+        _fake_donor(tmp_path, "kgp_sub_X.vcf", ["HG1", "HG2"]),
+    ]
+    pipeline._align_donor_samples(donors)
+    assert calls == [], "совпадающие доноры не должны переписываться"
+
+
+def test_align_fixes_sample_order(tmp_path, monkeypatch):
+    """Одинаковый набор, разный порядок колонок — правится только второй
+    файл, и по порядку первого."""
+    import main as pipeline
+
+    calls = []
+
+    def fake_run(args):
+        order_file = Path(args[args.index("-S") + 1])
+        calls.append((args[args.index("-S") + 2],
+                      order_file.read_text(encoding="utf-8").split()))
+        # имитируем результат bcftools, чтобы .replace() нашёл файл
+        Path(args[args.index("-o") + 1]).write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(pipeline, "_run_bcftools", fake_run)
+    monkeypatch.setattr(pipeline, "_index_vcf", lambda p: None)
+    donors = [
+        _fake_donor(tmp_path, "kgp_sub_1.vcf", ["HG1", "HG2", "HG3"]),
+        _fake_donor(tmp_path, "kgp_sub_X.vcf", ["HG3", "HG1", "HG2"]),
+    ]
+    pipeline._align_donor_samples(donors)
+    assert len(calls) == 1
+    target_file, order = calls[0]
+    assert "kgp_sub_X" in str(target_file)
+    assert order == ["HG1", "HG2", "HG3"]
+
+
+def test_align_takes_intersection_when_sample_counts_differ(tmp_path, monkeypatch):
+    """Кэш на 20 образцах + доскачанная хромосома на 503 → общие 20."""
+    import main as pipeline
+
+    written = {}
+
+    def fake_run(args):
+        order_file = Path(args[args.index("-S") + 1])
+        written[str(args[args.index("-S") + 2])] = order_file.read_text(
+            encoding="utf-8").split()
+
+    monkeypatch.setattr(pipeline, "_run_bcftools", fake_run)
+    monkeypatch.setattr(pipeline, "_index_vcf", lambda p: None)
+    monkeypatch.setattr(Path, "replace", lambda self, target: None)
+
+    donors = [
+        _fake_donor(tmp_path, "kgp_sub_1.vcf", ["HG1", "HG2"]),
+        _fake_donor(tmp_path, "kgp_sub_X.vcf", ["HG9", "HG2", "HG1", "HG7"]),
+    ]
+    monkeypatch.setattr(pipeline, "MIN_DONOR_SAMPLES", 2)
+    pipeline._align_donor_samples(donors)
+    assert len(written) == 1
+    assert list(written.values())[0] == ["HG1", "HG2"], (
+        "порядок берётся у первого донора, набор — пересечение"
+    )
+
+
+def test_align_refuses_when_intersection_too_small(tmp_path, monkeypatch):
+    """Пересечение почти пустое — это испорченный кэш, а не то, что можно
+    молча «починить» урезанием."""
+    import main as pipeline
+
+    monkeypatch.setattr(pipeline, "_run_bcftools", lambda args: None)
+    donors = [
+        _fake_donor(tmp_path, "kgp_sub_1.vcf", ["HG1", "HG2", "HG3", "HG4", "HG5"]),
+        _fake_donor(tmp_path, "kgp_sub_X.vcf", ["HG8", "HG9", "HG5", "HG6", "HG7"]),
+    ]
+    with pytest.raises(RuntimeError, match="общих образцов"):
+        pipeline._align_donor_samples(donors)
+
+
+def test_align_does_not_second_guess_a_small_but_consistent_cache(tmp_path, monkeypatch):
+    """Порог применяется только когда наборы расходятся. Если все доноры
+    согласованы, их число — осознанный выбор пользователя
+    (eur_sample_count), и ронять запуск из-за него нельзя."""
+    import main as pipeline
+
+    monkeypatch.setattr(pipeline, "_run_bcftools",
+                        lambda args: pytest.fail("не должно вызываться"))
+    donors = [
+        _fake_donor(tmp_path, "kgp_sub_1.vcf", ["HG1", "HG2"]),
+        _fake_donor(tmp_path, "kgp_sub_X.vcf", ["HG1", "HG2"]),
+    ]
+    pipeline._align_donor_samples(donors)   # не бросает
