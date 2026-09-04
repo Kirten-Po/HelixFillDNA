@@ -42,6 +42,7 @@ Server), теперь используют errors="replace" — невалидн
 from __future__ import annotations
 import gzip
 import logging
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -720,6 +721,85 @@ def normalise_x_ploidy(lines: list[str], genome_build: str = "grch37") -> tuple[
     return out, fixed
 
 
+_STRUCTURED_HEADER_RE = re.compile(r"^##(\w+)=<(.*)>\s*$")
+
+# Порядок тегов, которого требует htsjdk (парсер VCF на стороне сервера
+# импутации) в структурированных строках заголовка.
+_HEADER_TAG_ORDER = ("ID", "Number", "Type", "Description")
+
+
+def _split_header_fields(body: str) -> list[str]:
+    """Делит содержимое <...> по запятым, не трогая запятые внутри
+    кавычек (Description часто их содержит)."""
+    fields: list[str] = []
+    buf: list[str] = []
+    in_quotes = False
+    for ch in body:
+        if ch == '"':
+            in_quotes = not in_quotes
+            buf.append(ch)
+        elif ch == "," and not in_quotes:
+            fields.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        fields.append("".join(buf))
+    return fields
+
+
+def normalise_structured_header_line(line: str) -> str:
+    """
+    Приводит порядок тегов в строках ##INFO/##FORMAT к ID, Number, Type,
+    Description.
+
+    Зачем (найдено живым прогоном на TOPMed, задание отвергнуто на
+    валидации входа):
+
+        Unable to parse header with error: Your input file has a
+        malformed header: Tag Type in wrong order (was #2, expected #3)
+        in line <ID=END2,Type=Integer,Number=1,Description="Position of
+        breakpoint on CHR2">
+
+    Спецификация VCF порядок тегов не фиксирует, но htsjdk (парсер на
+    стороне сервера) требует именно такой и падает на любом другом.
+    Строка про END2 приезжает из набора 30x high-coverage — это поле
+    структурных вариантов, которое в наших данных не используется вовсе,
+    но `bcftools concat` разносит объединённый заголовок по ВСЕМ
+    хромосомам, поэтому одна кривая строка в донорах chrX роняет весь
+    набор из 23 файлов.
+
+    Перестановка тегов безопаснее удаления объявления: строки данных
+    сохраняют свою колонку INFO (VT, AF, AC и прочее из 1000 Genomes), и
+    объявления для них остаются на месте.
+    """
+    match = _STRUCTURED_HEADER_RE.match(line.rstrip("\n"))
+    if match is None:
+        return line
+    key, body = match.group(1), match.group(2)
+    if key not in ("INFO", "FORMAT"):
+        return line
+
+    fields = _split_header_fields(body)
+    by_name: dict[str, str] = {}
+    rest: list[str] = []
+    for field in fields:
+        name = field.split("=", 1)[0].strip()
+        if name in _HEADER_TAG_ORDER and name not in by_name:
+            by_name[name] = field
+        else:
+            rest.append(field)
+
+    ordered = [by_name[name] for name in _HEADER_TAG_ORDER if name in by_name]
+    if not ordered:
+        return line
+    new_body = ",".join(ordered + rest)
+    if new_body == body:
+        return line
+    suffix = "\n" if line.endswith("\n") else ""
+    return f"##{key}=<{new_body}>{suffix}"
+
+
 def split_autosomes(
     merged_vcf: Path,
     output_dir: Path,
@@ -765,6 +845,10 @@ def split_autosomes(
                 # См. UPLOAD_VCF_VERSION: сервер не умеет писать 4.3.
                 if line.startswith("##fileformat="):
                     line = f"##fileformat={UPLOAD_VCF_VERSION}\n"
+                else:
+                    # Порядок тегов ID/Number/Type/Description — см.
+                    # normalise_structured_header_line().
+                    line = normalise_structured_header_line(line)
                 header_lines.append(line)
                 continue
             parts = line.split("\t")
@@ -807,29 +891,112 @@ def split_autosomes(
 # ---------------------------------------------------------------------------
 # QC импутированных данных
 # ---------------------------------------------------------------------------
-def read_rsq(info_gz: Path) -> dict[tuple[str, int], float]:
-    """Читает Rsq из .info.gz."""
+_R2_IN_INFO_RE = re.compile(r"(?:^|;)R2=([0-9.eE+-]+)")
+
+
+def read_rsq_map(info_gz: Path) -> dict[tuple[str, int], float]:
+    """
+    Читает качество импутации (Rsq / R2) из chr*.info.gz.
+
+    Michigan Imputation Server отдаёт этот файл в ДВУХ разных форматах, и
+    поддерживать нужно оба:
+
+      1. Классический TSV с шапкой:
+             SNP  REF(0)  ALT(1)  ...  Rsq  Genotyped
+         Нужные колонки ищутся по именам.
+
+      2. Sites-only VCF (minimac4 4.x / imputationserver 2.x): первая
+         строка файла — "##fileformat=VCFv4.2", данные идут после
+         "#CHROM POS ID REF ALT QUAL FILTER INFO", а качество лежит в
+         поле INFO как "R2=0.87".
+
+    ⚠ Почему это не косметика (найдено разбором реального результата):
+    прежний разбор умел только формат 1. Встретив формат 2, он читал
+    первой строкой "##fileformat=VCFv4.2", не находил ни одной нужной
+    колонки — и вызывающий код (template/assembler.py) МОЛЧА получал
+    пустую карту, после чего подставлял Rsq=1.0 КАЖДОЙ позиции. Порог
+    Rsq переставал отсекать что бы то ни было, без единого сообщения в
+    лог. На реальном прогоне так в итоговый файл прошло 10-12 %
+    импутированных позиций с R2 < 0.3 при выставленном пороге 0.30.
+
+    Пустая карта поэтому громко логируется: молчаливое "качество у всех
+    идеальное" — худший из возможных вариантов поведения.
+
+    Позиции без значения качества (TYPED_ONLY — реальные измерения чипа,
+    которым Rsq не нужен) в карту не попадают; вызывающий код трактует
+    их отсутствие как "фильтровать нечего", и это верно.
+    """
     result: dict[tuple[str, int], float] = {}
+    info_gz = Path(info_gz)
+    if not info_gz.exists():
+        return result
+
     # errors="replace" для единообразия с остальными местами модуля,
     # читающими файлы, потенциально прошедшие через внешние инструменты
-    # (см. докстринг модуля) — сами Rsq-значения всегда чистый ASCII.
+    # (см. докстринг модуля) — сами значения качества всегда чистый ASCII.
     with gzip.open(info_gz, "rt", encoding="utf-8", errors="replace") as f:
-        header = f.readline().rstrip("\n\r").split("\t")
-        lower = [x.lower() for x in header]
-        pos_idx = next((i for i, x in enumerate(lower) if x in {"position", "pos"}), None)
-        chr_idx = next((i for i, x in enumerate(lower) if x in {"chromosome", "chrom", "chr"}), None)
-        rsq_idx = next((i for i, x in enumerate(lower) if x == "rsq"), None)
-        if pos_idx is None or chr_idx is None or rsq_idx is None:
-            raise PureCoreError(f"Не найдены CHROM/POS/Rsq в {info_gz}. Заголовок: {header}")
-        for line in f:
-            if not line.strip():
-                continue
-            fields = line.rstrip("\n\r").split("\t")
-            try:
-                key = (_normalise_chrom(fields[chr_idx]), int(fields[pos_idx]))
-                result[key] = float(fields[rsq_idx])
-            except (ValueError, IndexError):
-                continue
+        first = f.readline()
+        if first.startswith("##"):
+            for line in f:
+                if line.startswith("#") or not line.strip():
+                    continue
+                fields = line.rstrip("\n\r").split("\t")
+                if len(fields) < 8:
+                    continue
+                match = _R2_IN_INFO_RE.search(fields[7])
+                if match is None:
+                    continue
+                try:
+                    key = (_normalise_chrom(fields[0]), int(fields[1]))
+                    result[key] = float(match.group(1))
+                except (ValueError, IndexError):
+                    continue
+        else:
+            header = first.rstrip("\n\r").split("\t")
+            lower = [x.lower() for x in header]
+            pos_idx = next((i for i, x in enumerate(lower) if x in {"position", "pos"}), None)
+            chr_idx = next((i for i, x in enumerate(lower) if x in {"chromosome", "chrom", "chr"}), None)
+            rsq_idx = next((i for i, x in enumerate(lower) if x in {"rsq", "r2"}), None)
+            if pos_idx is not None and chr_idx is not None and rsq_idx is not None:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    fields = line.rstrip("\n\r").split("\t")
+                    try:
+                        key = (_normalise_chrom(fields[chr_idx]), int(fields[pos_idx]))
+                        result[key] = float(fields[rsq_idx])
+                    except (ValueError, IndexError):
+                        continue
+
+    if not result:
+        logger.warning(
+            "⚠ Не удалось прочитать ни одного значения качества импутации "
+            "из %s — формат файла не распознан. Фильтрация по порогу Rsq "
+            "для этой хромосомы НЕ РАБОТАЕТ: в итоговый файл попадут в том "
+            "числе ненадёжные импутированные генотипы. Поддерживаются TSV "
+            "с колонкой Rsq и sites-only VCF с R2= в поле INFO.",
+            info_gz.name,
+        )
+    else:
+        logger.info("%s: прочитано %d значений качества импутации",
+                    info_gz.name, len(result))
+    return result
+
+
+def read_rsq(info_gz: Path) -> dict[tuple[str, int], float]:
+    """
+    Строгая обёртка над read_rsq_map() для qc_imputed_vcf(): там пустая
+    карта означала бы, что КАЖДАЯ позиция будет забракована как "нет
+    данных о качестве", поэтому нераспознанный файл лучше превратить в
+    явную ошибку, а не в тихо испорченный результат.
+    """
+    result = read_rsq_map(info_gz)
+    if not result:
+        raise PureCoreError(
+            f"Не удалось прочитать значения качества импутации из {info_gz} — "
+            f"формат не распознан (ожидается TSV с колонкой Rsq либо "
+            f"sites-only VCF с R2= в поле INFO)."
+        )
     return result
 
 

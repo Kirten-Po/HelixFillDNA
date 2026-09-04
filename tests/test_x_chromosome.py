@@ -574,3 +574,76 @@ def test_grch38_x_subset_cache_has_its_own_name():
     assert dd._eur_subset_cache_path(cache, 1, 503, "grch38").name == (
         "EUR503.chr1.vcf.gz"
     )
+
+
+# ---------------------------------------------------------------------------
+# 9. Порядок тегов в заголовке VCF
+# ---------------------------------------------------------------------------
+# Задание на TOPMed отвергалось ещё на валидации входа:
+#   Unable to parse header ... Tag Type in wrong order (was #2, expected #3)
+#   in line <ID=END2,Type=Integer,Number=1,Description="...">
+# Спецификация VCF порядок тегов не фиксирует, htsjdk на стороне сервера —
+# требует. Кривая строка приезжает из набора 30x high-coverage (поле
+# структурных вариантов END2), а bcftools concat разносит объединённый
+# заголовок по всем 23 файлам — одна строка в донорах chrX роняла весь набор.
+def test_header_tag_order_is_normalised():
+    from core.pure_python_core import normalise_structured_header_line as fix
+
+    assert fix(
+        '##INFO=<ID=END2,Type=Integer,Number=1,Description="Position of breakpoint on CHR2">'
+    ) == (
+        '##INFO=<ID=END2,Number=1,Type=Integer,Description="Position of breakpoint on CHR2">'
+    )
+
+
+def test_commas_inside_description_are_not_split():
+    from core.pure_python_core import normalise_structured_header_line as fix
+
+    line = '##INFO=<ID=AF,Type=Float,Number=A,Description="frequency, range (0,1)">'
+    assert fix(line) == (
+        '##INFO=<ID=AF,Number=A,Type=Float,Description="frequency, range (0,1)">'
+    )
+
+
+def test_correct_lines_are_left_untouched():
+    from core.pure_python_core import normalise_structured_header_line as fix
+
+    for line in (
+        '##INFO=<ID=AF,Number=A,Type=Float,Description="freq">\n',
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n',
+        '##contig=<ID=chr1,length=248956422>\n',
+        '##fileDate=26022019\n',
+        '##fileformat=VCFv4.2\n',
+    ):
+        assert fix(line) == line
+
+
+def test_extra_tags_are_preserved_after_the_four(tmp_path):
+    from core.pure_python_core import normalise_structured_header_line as fix
+
+    line = '##INFO=<ID=X,Type=Integer,Number=1,Source="dbsnp",Version="2">'
+    assert fix(line) == (
+        '##INFO=<ID=X,Number=1,Type=Integer,Source="dbsnp",Version="2">'
+    )
+
+
+def test_split_autosomes_fixes_the_header(tmp_path):
+    """Сквозная проверка: кривая строка не должна доехать до upload/."""
+    from core.pure_python_core import split_autosomes
+
+    pytest.importorskip("Bio.bgzf", reason="biopython не установлен")
+    merged = tmp_path / "merged.vcf"
+    merged.write_text(
+        "##fileformat=VCFv4.3\n"
+        '##INFO=<ID=END2,Type=Integer,Number=1,Description="breakpoint">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n"
+        "1\t100\trs1\tA\tG\t.\tPASS\t.\tGT\t0/1\n",
+        encoding="utf-8", newline="\n",
+    )
+    split_autosomes(merged, tmp_path / "upload")
+    with gzip.open(tmp_path / "upload" / "chr1.vcf.gz", "rt") as f:
+        head = f.read().splitlines()
+    assert head[0] == "##fileformat=VCFv4.2"
+    assert head[1] == (
+        '##INFO=<ID=END2,Number=1,Type=Integer,Description="breakpoint">'
+    )

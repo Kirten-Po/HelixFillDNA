@@ -11,6 +11,7 @@ import logging
 import shutil
 import subprocess
 from typing import Iterator
+from core.pure_python_core import read_rsq_map
 from .skeleton import SkeletonRow, extract_skeleton
 
 logger = logging.getLogger(__name__)
@@ -143,26 +144,7 @@ def _load_one_dose_file(
     _dose_file_pairs())."""
 
     # 1. Загружаем Rsq для этой хромосомы
-    rsq_map: dict[tuple[str, int], float] = {}
-    if info_path.exists():
-        with gzip.open(info_path, "rt", encoding="utf-8") as f:
-            header = f.readline().rstrip("\n\r").split("\t")
-            lower = [x.lower() for x in header]
-            pos_idx = next((i for i, x in enumerate(lower) if x in {"position", "pos"}), None)
-            chr_idx = next((i for i, x in enumerate(lower) if x in {"chromosome", "chrom", "chr"}), None)
-            rsq_idx = next((i for i, x in enumerate(lower) if x == "rsq"), None)
-
-            if pos_idx is not None and chr_idx is not None and rsq_idx is not None:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    fields = line.rstrip("\n\r").split("\t")
-                    try:
-                        c = fields[chr_idx].replace("chr", "")
-                        p = int(fields[pos_idx])
-                        rsq_map[(c, p)] = float(fields[rsq_idx])
-                    except (ValueError, IndexError):
-                        continue
+    rsq_map = read_rsq_map(info_path)
 
     # 2. Индексируем VCF, если нужно
     tbi_path = vcf_path.with_suffix(".vcf.gz.tbi")
