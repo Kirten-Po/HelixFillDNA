@@ -425,7 +425,9 @@ VCF_TEMPLATE_BY_BUILD: dict[str, str] = {
 DEFAULT_GENOME_BUILD = "grch37"
 
 
-def _mirrors_for_build(genome_build: str) -> list[str]:
+def _mirrors_for_build(genome_build: str, chrom=None) -> list[str]:
+    if chrom is not None and is_x_chrom(chrom) and genome_build in X_MIRRORS_BY_BUILD:
+        return X_MIRRORS_BY_BUILD[genome_build]
     try:
         return MIRRORS_BY_BUILD[genome_build]
     except KeyError:
@@ -447,9 +449,45 @@ def _mirrors_for_build(genome_build: str) -> list[str]:
 #
 # Для GRCh38-релиза (20190312_biallelic_SNV_and_INDEL) chrX следует
 # общему шаблону — отдельных кандидатов не требуется.
+# ---------------------------------------------------------------------------
+# ⚠ GRCh38 и chrX: nonPAR лежит В ДРУГОМ НАБОРЕ ДАННЫХ.
+#
+# Найдено живым прогоном на панели TOPMed: донор для X дал всего 610
+# позиций из ~30 тысяч. Причина не в фильтрации — сам файл
+# ALL.chrX.shapeit2_integrated_snvindels_v2a_27022019.GRCh38.phased.vcf.gz
+# из релиза 20190312_biallelic_SNV_and_INDEL содержит ТОЛЬКО
+# псевдоаутосомные регионы: 97 875 вариантов в 0-3 Мб (PAR1), 9 088 в
+# 155-156 Мб (PAR2) и РОВНО НОЛЬ в nonPAR (3-155 Мб). Это особенность
+# самого релиза, а не сбой скачивания — тот же 23-мегабайтный файл лежит
+# и на зеркале UCSC (hgdownload.soe.ucsc.edu/gbdb/hg38/1000Genomes/).
+#
+# Полноценный chrX для GRCh38 есть в наборе 30x high-coverage
+# (20220422_3202_phased_SNV_INDEL_SV, 3202 образца). У него И другая
+# директория, И другой шаблон имени, И — отдельно — у самого X суффикс
+# ".v2", которого нет у аутосом этого же набора.
+#
+# Смешение наборов безопасно: доноры отбираются по конкретным
+# идентификаторам образцов EUR-подвыборки (те же HG*/NA*), и все они есть
+# в обоих наборах; несовпадение состава/порядка колонок между
+# хромосомами дополнительно вычищается в main.py::_align_donor_samples().
+GRCH38_X_MIRRORS = [
+    "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/"
+    "1000G_2504_high_coverage/working/20220422_3202_phased_SNV_INDEL_SV/",
+]
+GRCH38_X_VCF_TEMPLATE = (
+    "1kGP_high_coverage_Illumina.chr{chrom}"
+    ".filtered.SNV_INDEL_SV_phased_panel.{suffix}.vcf.gz"
+)
+
 X_VCF_SUFFIX_CANDIDATES_BY_BUILD: dict[str, list[str]] = {
     "grch37": ["v1c", "v1b"],
-    "grch38": GRCH38_VCF_SUFFIX_CANDIDATES,
+    "grch38": ["v2"],
+}
+X_MIRRORS_BY_BUILD: dict[str, list[str]] = {
+    "grch38": GRCH38_X_MIRRORS,
+}
+X_VCF_TEMPLATE_BY_BUILD: dict[str, str] = {
+    "grch38": GRCH38_X_VCF_TEMPLATE,
 }
 
 # Хромосомы, которые обрабатывает пайплайн доноров. X добавлена вместе с
@@ -491,7 +529,9 @@ def _vcf_suffix_candidates_for_build(genome_build: str, chrom=None) -> list[str]
     return VCF_SUFFIX_CANDIDATES_BY_BUILD.get(genome_build, VCF_SUFFIX_CANDIDATES)
 
 
-def _vcf_template_for_build(genome_build: str) -> str:
+def _vcf_template_for_build(genome_build: str, chrom=None) -> str:
+    if chrom is not None and is_x_chrom(chrom) and genome_build in X_VCF_TEMPLATE_BY_BUILD:
+        return X_VCF_TEMPLATE_BY_BUILD[genome_build]
     return VCF_TEMPLATE_BY_BUILD.get(genome_build, VCF_TEMPLATE)
 
 
@@ -1317,15 +1357,26 @@ def _link_or_copy(src: Path, dst: Path) -> None:
 # меняется (это независимые AND-условия, порядок не важен), а кэшируемый
 # файл получается ещё компактнее.
 # ---------------------------------------------------------------------------
-def _eur_subset_cache_path(cache_dir: Path, chrom: int, eur_sample_count: int) -> Path:
+def _eur_subset_cache_path(
+    cache_dir: Path, chrom, eur_sample_count: int,
+    genome_build: str = DEFAULT_GENOME_BUILD,
+) -> Path:
     """
     Промт "настраиваемое количество EUR-доноров": имя файла кэша
-    подвыборки теперь включает фактическое число образцов
+    подвыборки включает фактическое число образцов
     (f"EUR{N}.chr{chrom}.vcf.gz") — без этого подвыборка на 20 образцов
     молча использовалась бы как "уже готовая" и для запроса с другим
     eur_sample_count, давая неверный (заниженный/иной) набор доноров без
     единой ошибки в логе.
+
+    genome_build нужен по той же причине, но по другой оси: для GRCh38
+    chrX источник данных СМЕНИЛСЯ (см. GRCH38_X_MIRRORS — прежний файл
+    релиза 20190312 содержал только PAR). Кэш, построенный из старого
+    PAR-файла, обязан перестать совпадать по имени, иначе он молча
+    переиспользовался бы и X снова осталась бы почти пустой.
     """
+    if is_x_chrom(chrom) and genome_build in X_MIRRORS_BY_BUILD:
+        return Path(cache_dir) / f"EUR{eur_sample_count}.chrX.highcov.vcf.gz"
     return Path(cache_dir) / f"EUR{eur_sample_count}.chr{chrom}.vcf.gz"
 
 
@@ -1338,6 +1389,7 @@ def _ensure_eur_subset(
     bcftools_threads: int = 1,
     raw_cache_dir: Optional[Path] = None,
     eur_sample_count: int = 20,
+    genome_build: str = DEFAULT_GENOME_BUILD,
 ) -> Path:
     """
     Возвращает путь к VCF со всеми позициями хромосомы, но только
@@ -1361,7 +1413,8 @@ def _ensure_eur_subset(
     случае должен использовать старую однокомандную фильтрацию).
     """
     if raw_cache_dir is not None:
-        cached = _eur_subset_cache_path(Path(raw_cache_dir), chrom, eur_sample_count)
+        cached = _eur_subset_cache_path(
+            Path(raw_cache_dir), chrom, eur_sample_count, genome_build)
         cached_tbi = cached.with_suffix(cached.suffix + ".tbi")
         if (cached.exists() and cached_tbi.exists()
                 and verify_file_fast(cached) and verify_file_fast(cached_tbi)):
@@ -1417,7 +1470,8 @@ def _ensure_eur_subset(
         )
 
     if raw_cache_dir is not None:
-        cached = _eur_subset_cache_path(Path(raw_cache_dir), chrom, eur_sample_count)
+        cached = _eur_subset_cache_path(
+            Path(raw_cache_dir), chrom, eur_sample_count, genome_build)
         cached_tbi = cached.with_suffix(cached.suffix + ".tbi")
         subset_tbi = subset_vcf.with_suffix(subset_vcf.suffix + ".tbi")
         try:
@@ -1460,7 +1514,7 @@ def _raw_cache_has_chrom(raw_cache_dir: Path, chrom: int, genome_build: str = DE
     сборки, иначе поиск ничего не найдёт даже при валидном кэше.
     """
     raw_cache_dir = Path(raw_cache_dir)
-    template = _vcf_template_for_build(genome_build)
+    template = _vcf_template_for_build(genome_build, chrom)
     for suffix in _vcf_suffix_candidates_for_build(genome_build, chrom):
         cached_vcf = raw_cache_dir / template.format(chrom=chrom, suffix=suffix)
         cached_tbi = cached_vcf.with_suffix(cached_vcf.suffix + ".tbi")
@@ -1495,7 +1549,7 @@ def _load_from_raw_cache(
     Если bcftools_path не передан (обратная совместимость) — проверка
     пропускается, поведение как раньше.
     """
-    template = _vcf_template_for_build(genome_build)
+    template = _vcf_template_for_build(genome_build, chrom)
     for suffix in _vcf_suffix_candidates_for_build(genome_build, chrom):
         cached_vcf = raw_cache_dir / template.format(chrom=chrom, suffix=suffix)
         cached_tbi = cached_vcf.with_suffix(cached_vcf.suffix + ".tbi")
@@ -1534,7 +1588,7 @@ def _store_in_raw_cache(
     try:
         raw_cache_dir = Path(raw_cache_dir)
         raw_cache_dir.mkdir(parents=True, exist_ok=True)
-        template = _vcf_template_for_build(genome_build)
+        template = _vcf_template_for_build(genome_build, chrom)
         cached_vcf = raw_cache_dir / template.format(chrom=chrom, suffix=suffix)
         cached_tbi = cached_vcf.with_suffix(cached_vcf.suffix + ".tbi")
         _link_or_copy(dest, cached_vcf)
@@ -1661,8 +1715,8 @@ def download_chromosome_vcf(
             working_suffix_by_mirror.setdefault("_raw_cache", found_suffix)
             return True
 
-    build_mirrors = _mirrors_for_build(genome_build)
-    build_template = _vcf_template_for_build(genome_build)
+    build_mirrors = _mirrors_for_build(genome_build, chrom)
+    build_template = _vcf_template_for_build(genome_build, chrom)
     build_suffix_candidates = _vcf_suffix_candidates_for_build(genome_build, chrom)
 
     for mirror in build_mirrors:
@@ -2010,7 +2064,7 @@ def process_chromosome(
             subset_source = _ensure_eur_subset(
                 tmp_vcf, eur_file, chrom, htslib, output_dir,
                 bcftools_threads=bcftools_threads, raw_cache_dir=raw_cache_dir,
-                eur_sample_count=eur_sample_count,
+                eur_sample_count=eur_sample_count, genome_build=genome_build,
             )
             subset_has_samples_filtered = True
         except RuntimeError as e:
@@ -2498,8 +2552,8 @@ def process_chromosome_remote(
     # накладные расходы дают не сами remote-попытки, а последующий откат
     # на полное скачивание, а не перебор как таковой.
     remote_attempt_started = time.monotonic()
-    build_mirrors = _mirrors_for_build(genome_build)
-    build_template = _vcf_template_for_build(genome_build)
+    build_mirrors = _mirrors_for_build(genome_build, chrom)
+    build_template = _vcf_template_for_build(genome_build, chrom)
     build_suffix_candidates = _vcf_suffix_candidates_for_build(genome_build, chrom)
     try:
         for mirror in build_mirrors:

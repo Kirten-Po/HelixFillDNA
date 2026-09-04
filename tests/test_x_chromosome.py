@@ -479,3 +479,98 @@ def test_align_does_not_second_guess_a_small_but_consistent_cache(tmp_path, monk
         _fake_donor(tmp_path, "kgp_sub_X.vcf", ["HG1", "HG2"]),
     ]
     pipeline._align_donor_samples(donors)   # не бросает
+
+
+# ---------------------------------------------------------------------------
+# 7. Версия формата VCF в файлах для загрузки
+# ---------------------------------------------------------------------------
+# Живой прогон на панели TOPMed провалился на QC:
+#   Task 'Calculating QC Statistics Writing VCF version VCF4_3 is not
+#   implemented
+# QC-шаг сервера умеет писать VCF только до 4.2, а GRCh38-релиз
+# 1000 Genomes (доноры для TOPMed) объявляет себя VCFv4.3 — и bcftools
+# merge поднимает версию всего задания до неё. К X отношения не имеет:
+# на HRC доноры 4.1, поэтому там это никогда не всплывало.
+def test_upload_files_declare_vcf42(tmp_path):
+    from core.pure_python_core import UPLOAD_VCF_VERSION, split_autosomes
+
+    pytest.importorskip("Bio.bgzf", reason="biopython не установлен")
+    assert UPLOAD_VCF_VERSION == "VCFv4.2"
+
+    merged = tmp_path / "merged.vcf"
+    merged.write_text(
+        "##fileformat=VCFv4.3\n"
+        "##FILTER=<ID=PASS,Description=\"All filters passed\">\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n"
+        "1\t100\trs1\tA\tG\t.\tPASS\t.\tGT\t0/1\n",
+        encoding="utf-8", newline="\n",
+    )
+    split_autosomes(merged, tmp_path / "upload")
+
+    with gzip.open(tmp_path / "upload" / "chr1.vcf.gz", "rt") as f:
+        lines = f.read().splitlines()
+    assert lines[0] == "##fileformat=VCFv4.2"
+    # остальной заголовок и данные не тронуты
+    assert lines[1] == '##FILTER=<ID=PASS,Description="All filters passed">'
+    assert lines[-1] == "1\t100\trs1\tA\tG\t.\tPASS\t.\tGT\t0/1"
+
+
+# ---------------------------------------------------------------------------
+# 8. GRCh38 + chrX: другой набор данных
+# ---------------------------------------------------------------------------
+# Найдено живым прогоном на TOPMed: донор для X дал 610 позиций из ~30 000.
+# Файл ALL.chrX...v2a_27022019.GRCh38.phased.vcf.gz из релиза
+# 20190312_biallelic_SNV_and_INDEL содержит ТОЛЬКО псевдоаутосомные
+# регионы — 97 875 вариантов в PAR1, 9 088 в PAR2 и ровно ноль в nonPAR.
+# Это особенность релиза (тот же файл лежит и на зеркале UCSC), поэтому
+# nonPAR для GRCh38 берётся из набора 30x high-coverage, где у X ещё и
+# собственный суффикс имени.
+def test_grch38_x_uses_high_coverage_dataset():
+    import download_donors as dd
+
+    mirror = dd._mirrors_for_build("grch38", "X")[0]
+    assert "20220422_3202_phased_SNV_INDEL_SV" in mirror
+    name = dd._vcf_template_for_build("grch38", "X").format(
+        chrom="X", suffix=dd._vcf_suffix_candidates_for_build("grch38", "X")[0],
+    )
+    assert name == (
+        "1kGP_high_coverage_Illumina.chrX"
+        ".filtered.SNV_INDEL_SV_phased_panel.v2.vcf.gz"
+    )
+
+
+def test_grch38_autosomes_keep_their_own_dataset():
+    """Смена источника касается ТОЛЬКО X: аутосомы GRCh38 остаются на
+    релизе 20190312."""
+    import download_donors as dd
+
+    assert "20190312" in dd._mirrors_for_build("grch38", 1)[0]
+    assert "shapeit2_integrated_snvindels" in dd._vcf_template_for_build("grch38", 1)
+    # и без указания хромосомы поведение прежнее
+    assert dd._mirrors_for_build("grch38") == dd._mirrors_for_build("grch38", 7)
+
+
+def test_grch37_x_is_not_affected():
+    """У GRCh37 chrX полноценный, менять источник незачем."""
+    import download_donors as dd
+
+    assert "20130502" in dd._mirrors_for_build("grch37", "X")[0]
+    assert dd._vcf_suffix_candidates_for_build("grch37", "X") == ["v1c", "v1b"]
+
+
+def test_grch38_x_subset_cache_has_its_own_name():
+    """Кэш подвыборки, построенный из старого PAR-файла, не должен
+    совпасть по имени с новым — иначе он молча переиспользуется и X
+    снова окажется почти пустой."""
+    import download_donors as dd
+
+    cache = Path("/cache")
+    assert dd._eur_subset_cache_path(cache, "X", 503, "grch38").name == (
+        "EUR503.chrX.highcov.vcf.gz"
+    )
+    assert dd._eur_subset_cache_path(cache, "X", 503, "grch37").name == (
+        "EUR503.chrX.vcf.gz"
+    )
+    assert dd._eur_subset_cache_path(cache, 1, 503, "grch38").name == (
+        "EUR503.chr1.vcf.gz"
+    )

@@ -584,6 +584,28 @@ def _reprefix_chrom_field(line: str, chrom_prefix: str) -> str:
 # измерения чипа (если они есть в исходном файле).
 UPLOAD_CHROMS: list[str] = [str(i) for i in range(1, 23)] + ["X"]
 
+# Версия формата, которую мы объявляем в файлах для загрузки на сервер
+# импутации.
+#
+# Зачем принудительно (найдено живым прогоном на панели TOPMed, задание
+# провалилось на QC):
+#
+#     Task 'Calculating QC Statistics Writing VCF version VCF4_3 is not
+#     implemented
+#
+# QC-шаг сервера (htsjdk) умеет писать VCF только до 4.2. Наш
+# sample.vcf.gz всегда 4.2, но GRCh38-релиз 1000 Genomes
+# (20190312_biallelic_SNV_and_INDEL, доноры для TOPMed) объявляет себя
+# VCFv4.3, и `bcftools merge` поднимает версию всего задания до неё. На
+# HRC этого не происходит: там доноры phase3/GRCh37 — VCFv4.1.
+#
+# Понижение безопасно: 4.3 отличается от 4.2 поддержкой UTF-8,
+# percent-кодирования спецсимволов и полем IDX, а в наших файлах ничего
+# этого нет — записи после `-m2 -M2 -v snps` и post-merge intersect это
+# биаллельные SNP с единственным полем GT, заголовок — обычный ASCII
+# (проверено на реальном заголовке: ни IDX=, ни percent-кодирования).
+UPLOAD_VCF_VERSION = "VCFv4.2"
+
 
 _MISSING_GT = {"./.", ".|.", ".", "./.|.", ""}
 
@@ -740,6 +762,9 @@ def split_autosomes(
     with opener(merged_vcf, "rt", encoding="utf-8", errors="replace") as f:
         for line in f:
             if line.startswith("#"):
+                # См. UPLOAD_VCF_VERSION: сервер не умеет писать 4.3.
+                if line.startswith("##fileformat="):
+                    line = f"##fileformat={UPLOAD_VCF_VERSION}\n"
                 header_lines.append(line)
                 continue
             parts = line.split("\t")
