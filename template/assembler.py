@@ -44,6 +44,17 @@ class ValidationResult:
     # 23andMe-экспортов), а не ошибка конвертации. Поэтому НЕ входит в
     # errors/is_valid — только информационное поле для прозрачности.
     template_duplicate_positions: list[tuple[str, int]]
+    # Промт "странные генотипы в результате TOPMed": позиции, где значение
+    # генотипа не похоже на генотип 23andMe (не "--" и не одна-две буквы
+    # ACGT/DI). Проверка добавлена по следам реального случая, который
+    # прошёл ВСЕ прежние проверки незамеченным: панель TOPMed содержит
+    # инделы, генотип собирался склейкой аллелей, и 178 позиций из 959 708
+    # получили значения вида "TGTGATGTGA" — причём не просто странные на
+    # вид, а подменившие правильный генотип SNP на той же координате.
+    # Прежние проверки (число строк, число полей, переносы, идентичность
+    # первых трёх колонок) к содержимому четвёртой колонки не относятся
+    # вовсе, поэтому и пропустили это.
+    invalid_genotypes: list[tuple[int, str, str]]
 
     @property
     def is_valid(self) -> bool:
@@ -52,12 +63,20 @@ class ValidationResult:
             and self.fields_valid
             and self.crlf_match
             and self.structure_identical
+            and not self.invalid_genotypes
             and not self.errors
         )
 
 
 class AssemblyError(RuntimeError):
     pass
+
+
+# Допустимые значения колонки генотипа в файле 23andMe (см.
+# ValidationResult.invalid_genotypes). "D"/"I" — делеция/вставка, они
+# встречаются в настоящих экспортах 23andMe наравне с ACGT.
+_ALLOWED_ALLELES = frozenset("ACGTDI")
+_ALLOWED_GENOTYPES = frozenset({"--", "-"})
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +252,7 @@ def _load_one_dose_file(
         cmd.extend(["-R", str(panel_file)])
 
     proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    skipped_non_snp = 0
     for line in proc.stdout.splitlines():
         if not line.strip():
             continue
@@ -251,6 +271,31 @@ def _load_one_dose_file(
 
         if "," in alt:
             continue
+
+        # ТОЛЬКО ОДНОБУКВЕННЫЕ АЛЛЕЛИ (биаллельный SNP).
+        #
+        # ⚠ Найдено разбором реального результата TOPMed. Панель TOPMed r3,
+        # в отличие от HRC r1.1, содержит не только SNP, но и инделы. У
+        # инделя REF или ALT — строка из нескольких букв ("TGTGA", "CA"),
+        # и genotype = a1 + a2 ниже склеивал их в чудовища вроде
+        # "TGTGATGTGA" или строки на полсотни символов.
+        #
+        # Хуже того, это была не косметика, а ПОДМЕНА значения. Инделя и
+        # SNP нередко делят одну координату, а словарь genotypes ключуется
+        # по (хромосома, позиция) — то есть запись, прочитанная позже,
+        # затирала прочитанную раньше. Живой пример, chr1:11195977 (GRCh38):
+        #     rs17036508    REF=T      ALT=C  GT=0|0  -> "TT"   (нужный SNP)
+        #     rs533913726   REF=TGTGA  ALT=T  GT=0|0  -> "TGTGATGTGA"
+        # Индель шёл в файле вторым и затирал правильный генотип SNP.
+        # В итоговом файле такие позиции не просто странно выглядели —
+        # они были НЕВЕРНЫ. На реальном прогоне: 178 позиций из 959 708.
+        #
+        # На HRC этого никогда не было видно: панель HRC r1.1 состоит
+        # только из SNV, инделов там нет вовсе.
+        if len(ref) != 1 or len(alt) != 1:
+            skipped_non_snp += 1
+            continue
+
         if gt in ("./.", "."):
             continue
 
@@ -278,6 +323,14 @@ def _load_one_dose_file(
             genotypes[key] = genotype
         except (IndexError, ValueError):
             continue
+
+    if skipped_non_snp:
+        logger.info(
+            "chr%s: пропущено %d не-SNP записей (инделы панели TOPMed) — "
+            "формат 23andMe их не предусматривает, и они делят координаты "
+            "с настоящими SNP",
+            chrom, skipped_non_snp,
+        )
 
     if panel_set:
         panel_file.unlink(missing_ok=True)
@@ -454,6 +507,33 @@ def validate_output(output_path: Path, template_path: Path, format_version: str 
                 continue
             positions_seen.add(key)
 
+    # Промт "странные генотипы в результате TOPMed": содержимое колонки
+    # генотипа. Допустимо "--" (нет вызова), одна буква (гаплоидный вызов
+    # на X/Y/MT у мужчин — так пишет и сам 23andMe), две буквы, а также
+    # "D"/"I"/"DD"/"DI"/"II" — обозначения делеций/вставок, которые
+    # встречаются в настоящих экспортах 23andMe.
+    invalid_genotypes: list[tuple[int, str, str]] = []
+    for i, line in enumerate(output_data, start=1):
+        parts = line.rstrip("\r\n").split("\t")
+        if len(parts) < 4:
+            continue
+        genotype = parts[3]
+        if genotype in _ALLOWED_GENOTYPES:
+            continue
+        if 1 <= len(genotype) <= 2 and all(ch in _ALLOWED_ALLELES for ch in genotype):
+            continue
+        invalid_genotypes.append((i, f"{parts[1]}:{parts[2]}", genotype))
+
+    if invalid_genotypes:
+        shown = ", ".join(f"строка {n} ({pos}) = {gt!r}"
+                          for n, pos, gt in invalid_genotypes[:5])
+        errors.append(
+            f"Недопустимые значения генотипа: {len(invalid_genotypes)} шт. "
+            f"Первые: {shown}. Генотип в формате 23andMe — это '--' либо "
+            f"одна-две буквы; значения длиннее обычно означают, что в файл "
+            f"попал индель (склейка многобуквенных аллелей)."
+        )
+
     if template_duplicate_positions:
         logger.info(
             "В выходном файле %d раз(а) встречаются позиции, дублирующиеся "
@@ -469,4 +549,5 @@ def validate_output(output_path: Path, template_path: Path, format_version: str 
         crlf_expected=crlf_expected, crlf_match=crlf_match, chromosomes=chromosomes,
         call_rate=call_rate, structure_identical=structure_identical, errors=errors,
         template_duplicate_positions=template_duplicate_positions,
+        invalid_genotypes=invalid_genotypes,
     )
