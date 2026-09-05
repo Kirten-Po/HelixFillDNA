@@ -166,10 +166,29 @@ def _load_one_dose_file(
     rsq_map = read_rsq_map(info_path)
 
     # 2. Индексируем VCF, если нужно
-    tbi_path = vcf_path.with_suffix(".vcf.gz.tbi")
+    #
+    # ⚠ Path.with_suffix() заменяет ТОЛЬКО последнее расширение, а не всё
+    # после первой точки: для "chr1.dose.vcf.gz" вызов
+    # .with_suffix(".vcf.gz.tbi") давал "chr1.dose.vcf.vcf.gz.tbi" — путь,
+    # которого не существует никогда. Из-за этого проверка "индекс уже
+    # есть" не срабатывала ни разу, и tabix запускался всегда.
+    #
+    # На ПЕРВОЙ сборке это проходило незамеченным: индекса и правда ещё
+    # нет, tabix его создаёт. Но при ЛЮБОЙ повторной сборке того же
+    # запуска (а это штатный сценарий — пересобрать из уже скачанных
+    # rerun_results, не трогая сервер) tabix встречал настоящий .tbi,
+    # созданный в прошлый раз, и отказывался:
+    #     [tabix] the index file exists. Please use '-f' to overwrite.
+    # Этап 7 падал на chr1, не дойдя до сборки.
+    #
+    # Правильный путь — vcf_path.with_suffix(vcf_path.suffix + ".tbi")
+    # (так это и делается везде в download_donors.py/main.py). Плюс -f:
+    # если мы сюда дошли, индекса действительно нет, а флаг снимает
+    # гонку с параллельным запуском и делает повтор идемпотентным.
+    tbi_path = vcf_path.with_suffix(vcf_path.suffix + ".tbi")
     if not tbi_path.exists():
         tabix_result = subprocess.run(
-            [tabix, "-p", "vcf", str(vcf_path)], capture_output=True, text=True,
+            [tabix, "-p", "vcf", "-f", str(vcf_path)], capture_output=True, text=True,
         )
         if tabix_result.returncode != 0:
             # Раньше здесь стоял check=True без вывода stderr — до

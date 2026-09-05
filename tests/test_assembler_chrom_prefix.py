@@ -39,7 +39,12 @@ def _make_fake_imputed_dir(tmp_path: Path, chrom: str) -> Path:
     imputed_dir = tmp_path / "rerun_results"
     imputed_dir.mkdir()
     vcf_path = imputed_dir / f"chr{chrom}.dose.vcf.gz"
-    tbi_path = vcf_path.with_suffix(".vcf.gz.tbi")
+    # ⚠ Именно так, а не .with_suffix(".vcf.gz.tbi"): with_suffix заменяет
+    # только ПОСЛЕДНЕЕ расширение, и второй вариант дал бы
+    # "chr1.dose.vcf.vcf.gz.tbi". Ровно эта ошибка годами жила в
+    # assembler.py и роняла повторную сборку — тест повторял её и потому
+    # не ловил.
+    tbi_path = vcf_path.with_suffix(vcf_path.suffix + ".tbi")
     # Содержимое не важно — subprocess.run замокан целиком, реальный
     # bcftools/tabix эти файлы не читает. Существование vcf_path нужно,
     # чтобы load_imputed_genotypes() не пропустил хромосому как

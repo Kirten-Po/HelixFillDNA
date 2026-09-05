@@ -165,3 +165,29 @@ def test_invalid_genotypes_are_caught(tmp_path, genotype):
     assert result.invalid_genotypes[0][2] == genotype
     assert not result.is_valid, "файл с таким значением не должен считаться валидным"
     assert any("генотип" in e.lower() for e in result.errors), result.errors
+
+
+# ---------------------------------------------------------------------------
+# Повторная сборка из уже скачанных результатов
+# ---------------------------------------------------------------------------
+# Path.with_suffix() заменяет только ПОСЛЕДНЕЕ расширение: для
+# "chr1.dose.vcf.gz" вызов .with_suffix(".vcf.gz.tbi") давал
+# "chr1.dose.vcf.vcf.gz.tbi" — несуществующий путь. Проверка "индекс уже
+# есть" не срабатывала никогда, tabix запускался всегда, и на ПОВТОРНОЙ
+# сборке падал: "[tabix] the index file exists. Please use '-f'".
+# Первая сборка проходила, поэтому баг годами не проявлялся — а пересборка
+# из уже скачанных rerun_results это штатный сценарий.
+def test_reassembly_with_existing_index(tmp_path):
+    from template.assembler import load_imputed_genotypes
+
+    d = tmp_path / "rerun_results"
+    d.mkdir()
+    _write_dose(d / "chr1.dose.vcf.gz", [
+        "1\t100\trs1\tA\tG\t.\tPASS\t.\tGT\t0|1",
+    ])
+    first = load_imputed_genotypes(d, sample_name="genotek")
+    assert (d / "chr1.dose.vcf.gz.tbi").exists(), "индекс должен лечь рядом с VCF"
+
+    # Вторая сборка тем же кодом — раньше здесь падало.
+    second = load_imputed_genotypes(d, sample_name="genotek")
+    assert second == first == {"1_100": "AG"}
