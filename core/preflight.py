@@ -81,6 +81,10 @@ AUTOSOMES = {str(i) for i in range(1, 23)}
 #: с колоссальным запасом, а память и время прохода по трафарету экономит.
 BUILD_PROBE_SIZE = 5000
 
+#: Минимум сверенных с трафаретом маркеров, при котором вывод о сборке
+#: вообще имеет смысл делать.
+MIN_BUILD_COMPARISONS = 50
+
 _NO_CALL_CHARS = set("-0N.?")
 _BASES = set("ACGT")
 _PALINDROMIC = {frozenset("AT"), frozenset("CG")}
@@ -508,16 +512,22 @@ def analyse_file(
     return report
 
 
-def _detect_build(report: PreflightReport, probe: dict[str, int],
-                  template_path: Path) -> None:
+def build_match_pct(probe: dict[str, int],
+                    template_path: Path) -> tuple[Optional[float], int]:
     """
-    Сверяет позиции пробных rsID с трафаретом (реальный экспорт 23andMe в
-    GRCh37). Совпало почти всё — GRCh37; почти ничего — другая сборка.
-    Промежуточный результат честно называется неоднозначным, а не
-    округляется в удобную сторону.
+    Доля пробных rsID, чья позиция совпала с трафаретом (реальный экспорт
+    23andMe в GRCh37), и число сверенных маркеров.
+
+    Отдельная публичная функция, а не часть _detect_build(), потому что тем
+    же способом определяет сборку автодетект источника в
+    main.py::detect_source_from_file() (файлы Атласа приходят в GRCh38, и
+    отличить их от файлов в GRCh37 можно только по координатам —
+    оформление у них одинаковое). Возвращает (None, 0), если сверить не с
+    чем: нет пробы, нет трафарета, сверено меньше MIN_BUILD_COMPARISONS
+    маркеров.
     """
-    if not probe or not template_path.is_file():
-        return
+    if not probe or not Path(template_path).is_file():
+        return None, 0
     matched = compared = 0
     try:
         with open(template_path, "r", encoding="utf-8", errors="replace") as f:
@@ -540,11 +550,24 @@ def _detect_build(report: PreflightReport, probe: dict[str, int],
                     matched += 1
     except OSError as e:
         logger.info("Определение сборки пропущено: %s", e)
-        return
+        return None, 0
 
-    if compared < 50:
+    if compared < MIN_BUILD_COMPARISONS:
+        return None, compared
+    return 100.0 * matched / compared, compared
+
+
+def _detect_build(report: PreflightReport, probe: dict[str, int],
+                  template_path: Path) -> None:
+    """
+    Сверяет позиции пробных rsID с трафаретом (реальный экспорт 23andMe в
+    GRCh37). Совпало почти всё — GRCh37; почти ничего — другая сборка.
+    Промежуточный результат честно называется неоднозначным, а не
+    округляется в удобную сторону.
+    """
+    pct, compared = build_match_pct(probe, Path(template_path))
+    if pct is None:
         return
-    pct = 100.0 * matched / compared
     report.build_match_pct = pct
     report.build_probe_used = compared
     if pct >= BUILD_MATCH_PCT:
@@ -687,12 +710,24 @@ def _add_findings(r: PreflightReport) -> None:
                     f"совпало {r.build_match_pct:.1f}% позиций из "
                     f"{r.build_probe_used} сверенных с трафаретом"))
     elif r.build.startswith("не GRCh37"):
-        add(Finding("bad", f"Сборка генома: {r.build}",
-                    f"совпало всего {r.build_match_pct:.1f}% позиций из "
-                    f"{r.build_probe_used} сверенных с трафаретом",
-                    "Весь пайплайн и трафарет рассчитаны на GRCh37. "
-                    "Файл в другой сборке даст почти пустой результат — "
-                    "его нужно сначала перевести в GRCh37."))
+        if r.source == "atlas":
+            # Для Атласа GRCh38 — норма, а не поломка: координаты
+            # переносятся в GRCh37 на Этапе 0 (core/atlas_convert.py).
+            # Показывать здесь "✗" значило бы пугать пользователя тем,
+            # что программа сама и исправит через несколько секунд.
+            add(Finding("ok", "Сборка генома: GRCh38 (ожидаемо для Атласа)",
+                        f"совпало всего {r.build_match_pct:.1f}% позиций из "
+                        f"{r.build_probe_used} сверенных с трафаретом GRCh37",
+                        "Координаты будут перенесены в GRCh37 на Этапе 0 — "
+                        "отдельным видимым файлом, который можно проверить "
+                        "глазами и залить в Генотек как есть."))
+        else:
+            add(Finding("bad", f"Сборка генома: {r.build}",
+                        f"совпало всего {r.build_match_pct:.1f}% позиций из "
+                        f"{r.build_probe_used} сверенных с трафаретом",
+                        "Весь пайплайн и трафарет рассчитаны на GRCh37. "
+                        "Файл в другой сборке даст почти пустой результат — "
+                        "его нужно сначала перевести в GRCh37."))
     elif r.build == "неоднозначно":
         add(Finding("warn", "Сборку генома определить не удалось",
                     f"совпало {r.build_match_pct:.1f}% позиций из "

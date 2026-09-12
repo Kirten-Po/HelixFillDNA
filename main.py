@@ -231,14 +231,32 @@ from adapters.ancestry_v2 import (
     save_position_cache_broad as _save_position_cache_broad_ancestry,
     EXPECTED_HEADER as _ANCESTRY_HEADER_TOKENS,
 )
+from adapters.atlas import (
+    parse_atlas, AtlasFormatError,
+    save_position_cache as _save_position_cache_atlas,
+    save_position_cache_broad as _save_position_cache_broad_atlas,
+)
 from core.ancestry_convert import (
     prepare_ancestry_file, AncestryConvertError, CONVERTED_SUFFIX,
+)
+from core.atlas_convert import (
+    prepare_atlas_file, AtlasConvertError,
+    CONVERTED_SUFFIX as ATLAS_CONVERTED_SUFFIX,
+    detect_layout as atlas_detect_layout,
+    ATLAS_HEADER as _ATLAS_HEADER_TOKENS,
+    MAX_ATLAS_COMMENT_LINES as _ATLAS_MAX_COMMENT_LINES,
+)
+from core.preflight import (
+    build_match_pct as _build_match_pct,
+    BUILD_MATCH_PCT as preflight_BUILD_MATCH_PCT,
+    BUILD_MISMATCH_PCT as preflight_BUILD_MISMATCH_PCT,
 )
 from core.pure_python_core import (
     build_vcf, split_autosomes, PureCoreError, _chrom_sort_key, UPLOAD_CHROMS,
     infer_male_from_variants,
 )
 from core.archive_utils import sanitize_password_text
+from core.donor_cache import EUR_COUNT_UNCHECKED, eur_count_verdict
 from core.network_utils import (
     ensure_network_ready, make_ssl_context, BrokenCertStoreError,
 )
@@ -447,6 +465,16 @@ SOURCES = {
         "save_position_cache": _save_position_cache_ancestry,
         "save_position_cache_broad": _save_position_cache_broad_ancestry,
     },
+    "atlas": {
+        # Промт "файл компании Атлас": оформление — 23andMe (4 колонки,
+        # X/Y/MT, гаплоиды одной буквой), сборка — GRCh38. Приведение к
+        # GRCh37 делает Этап 0 (core/atlas_convert.py), парсер получает уже
+        # нормализованный файл — см. докстринг adapters/atlas.py.
+        "name": "Атлас (.txt, GRCh38)",
+        "parser": parse_atlas,
+        "save_position_cache": _save_position_cache_atlas,
+        "save_position_cache_broad": _save_position_cache_broad_atlas,
+    },
     "vcf": {
         "name": "Готовый VCF (свой файл / WGS)",
         "parser": parse_vcf_source,
@@ -462,16 +490,20 @@ SOURCES = {
 
 def _needs_reference(source: str) -> bool:
     """VCF-источнику референс не нужен — REF/ALT/GT там уже разрешены."""
-    return source in ("ftdna", "myheritage", "ancestry")
+    return source in ("ftdna", "myheritage", "ancestry", "atlas")
 
 
 #: Источники, которым перед Этапом 1 нужен отдельный шаг приведения
-#: файла к оформлению 23andMe v3 (Этап 0). Пока такой один — AncestryDNA:
-#: его сырой экспорт отличается от 23andMe не содержанием, а оформлением
-#: (5 колонок, коды хромосом 23-26, пропуск как аллель '0'), и отдельный
-#: шаг оставляет на диске промежуточный файл, который можно проверить
-#: глазами и залить в Генотек как есть — см. core/ancestry_convert.py.
-_SOURCES_NEEDING_CONVERSION = ("ancestry",)
+#: файла к оформлению 23andMe v3 в GRCh37 (Этап 0):
+#:   'ancestry' — сырой экспорт отличается от 23andMe не содержанием, а
+#:       оформлением (5 колонок, коды хромосом 23-26, пропуск как аллель
+#:       '0'), см. core/ancestry_convert.py;
+#:   'atlas' — оформление как раз 23andMe, но координаты в GRCh38, и их
+#:       надо перенести в GRCh37, в котором живёт весь остальной пайплайн,
+#:       см. core/atlas_convert.py.
+#: В обоих случаях отдельный шаг оставляет на диске промежуточный файл,
+#: который можно проверить глазами и залить в Генотек как есть.
+_SOURCES_NEEDING_CONVERSION = ("ancestry", "atlas")
 
 
 def _default_conversion_template(template_path: Optional[Path] = None) -> Optional[Path]:
@@ -493,11 +525,41 @@ def _default_conversion_template(template_path: Optional[Path] = None) -> Option
     return None
 
 
+def _grch38_to_grch37_liftover(
+    project_root: Optional[Path] = None,
+    progress_cb: Optional[Callable[[float, str], None]] = None,
+) -> ChainLiftover:
+    """
+    ChainLiftover на hg38ToHg19.over.chain.gz — тот же обратный chain-файл,
+    которым Этап 7 возвращает результат TopMed в GRCh37 (см.
+    ensure_liftover_chain(direction="reverse")). Нужен Этапу 0 для
+    источника 'atlas', координаты которого приходят в GRCh38.
+
+    Бросает RuntimeError, если chain-файл недоступен: тихо пропустить
+    перенос нельзя — получился бы файл с координатами GRCh38 под видом
+    GRCh37, и дальше весь пайплайн считал бы мусор.
+    """
+    chain_path = ensure_liftover_chain(
+        project_root=project_root, panel="topmed",
+        progress_cb=progress_cb, direction="reverse",
+    )
+    if chain_path is None:
+        raise RuntimeError(
+            "Не удалось получить chain-файл GRCh38 -> GRCh37 "
+            "(hg38ToHg19.over.chain.gz) — без него координаты файла Атласа "
+            "нельзя перенести в сборку, с которой работает остальной "
+            "пайплайн. Проверьте подключение к интернету и запустите ещё раз."
+        )
+    return ChainLiftover(chain_path)
+
+
 def prepare_source_file(
     source: str,
     csv_path: Path,
     output_dir: Path,
     template_path: Optional[Path] = None,
+    project_root: Optional[Path] = None,
+    progress_cb: Optional[Callable[[float, str], None]] = None,
 ) -> tuple[Path, Optional[object]]:
     """
     Этап 0. Возвращает (файл_для_парсинга, статистика_конвертации).
@@ -511,10 +573,24 @@ def prepare_source_file(
     обычные этапы идут уже по конвертированному файлу. Если на вход
     подсунули УЖЕ конвертированный файл (или любой другой в формате
     23andMe), конвертация пропускается — см. prepare_ancestry_file().
+
+    Для 'atlas' переносит координаты GRCh38 -> GRCh37 и пишет
+    output_dir/<имя>_grch37_23andme_v3.txt — см. core/atlas_convert.py.
+    Chain-файл при необходимости скачивается здесь же (project_root/
+    progress_cb передаются в ensure_liftover_chain()).
     """
     csv_path = Path(csv_path)
     if source not in _SOURCES_NEEDING_CONVERSION:
         return csv_path, None
+
+    if source == "atlas":
+        liftover = _grch38_to_grch37_liftover(
+            project_root=project_root, progress_cb=progress_cb)
+        stats = prepare_atlas_file(
+            csv_path, Path(output_dir), liftover,
+            template_path=_default_conversion_template(template_path),
+        )
+        return Path(stats.out_path), stats
 
     stats = prepare_ancestry_file(
         csv_path, Path(output_dir),
@@ -543,7 +619,7 @@ def _supports_liftover(source: str) -> bool:
     liftover и применяет его в том же месте (сразу после нормализации
     chrom/pos, до broad_key и до reference.base_at()).
     """
-    return source in ("ftdna", "myheritage", "ancestry")
+    return source in ("ftdna", "myheritage", "ancestry", "atlas")
 
 
 def _panel_config(panel: Optional[str]) -> dict:
@@ -689,6 +765,83 @@ def _myheritage_header_synonym_score(tokens: list[str]) -> int:
     return matched
 
 
+#: Сколько маркеров брать на пробу при определении сборки генома в
+#: автодетекте источника. Проба идёт по НАЧАЛУ файла (chr1) — этого
+#: достаточно: сдвиг координат между GRCh37 и GRCh38 систематический, на
+#: chr1 он такой же явный, как везде.
+_BUILD_PROBE_SIZE = 4000
+
+#: Трафареты, по которым сверяются позиции пробы — в порядке убывания
+#: пересечения с современными чипами (у genotek/v5 общих rsID с ними
+#: заметно больше, чем у v3, значит и сверенных маркеров будет больше).
+_BUILD_PROBE_TEMPLATES = (
+    "template_genotek.txt", "template_v5.txt", "template_v3.txt",
+)
+
+
+def _probe_positions_23andme(path: Path, limit: int = _BUILD_PROBE_SIZE) -> dict[str, int]:
+    """rsid -> позиция для первых limit маркеров файла в оформлении 23andMe."""
+    probe: dict[str, int] = {}
+    with _vcf_open_text(path) as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            parts = line.rstrip("\r\n").split("\t")
+            if len(parts) < 4:
+                continue
+            rsid = parts[0].strip()
+            if not rsid.startswith("rs"):
+                continue
+            try:
+                probe[rsid] = int(parts[2].strip())
+            except ValueError:
+                continue
+            if len(probe) >= limit:
+                break
+    return probe
+
+
+def _looks_like_grch38(path: Path) -> Optional[bool]:
+    """
+    True — координаты файла почти не совпадают с трафаретом (GRCh37),
+    то есть это другая сборка, на практике GRCh38.
+    False — совпадают, это GRCh37.
+    None — сверить не с чем (нет трафаретов, мало общих rsID) либо
+    результат неоднозначный; вызывающий код в этом случае НЕ должен
+    делать выводов о сборке.
+
+    Нужно автодетекту источника: файл Атласа оформлен ровно как сырые
+    данные 23andMe, и единственное, что его выдаёт, — координаты в GRCh38
+    (см. core/atlas_convert.py).
+    """
+    try:
+        probe = _probe_positions_23andme(path)
+    except OSError as e:
+        logger.info("Проба сборки генома не удалась для %s: %s", path, e)
+        return None
+    if not probe:
+        return None
+
+    samples_dir = PROJECT_ROOT / "samples"
+    for name in _BUILD_PROBE_TEMPLATES:
+        template = samples_dir / name
+        if not template.is_file():
+            continue
+        pct, compared = _build_match_pct(probe, template)
+        if pct is None:
+            continue
+        logger.info(
+            "Проба сборки генома по %s: совпало %.1f%% из %d маркеров",
+            name, pct, compared,
+        )
+        if pct <= preflight_BUILD_MISMATCH_PCT:
+            return True
+        if pct >= preflight_BUILD_MATCH_PCT:
+            return False
+        return None
+    return None
+
+
 def detect_source_from_file(path: Path) -> tuple[Optional[str], float]:
     """
     Определяет вероятный источник
@@ -791,6 +944,35 @@ def detect_source_from_file(path: Path) -> tuple[Optional[str], float]:
             if tokens == _ANCESTRY_HEADER_TOKENS:
                 return "ancestry", 0.95
             break
+
+        # --- 3.5 Атлас (СТРОГО до MyHeritage) -------------------------
+        # Оформление у Атласа — ровно 23andMe (одна '#'-строка колонок,
+        # 4 колонки через табуляцию), поэтому правило 4(б) "табов больше,
+        # чем запятых" опознавало его как MyHeritage, а координаты у него
+        # в GRCh38 — и весь пайплайн сверял бы их с GRCh37-референсом,
+        # получая мусор (см. core/atlas_convert.py). Отличить по шапке
+        # нельзя: она совпадает с 23andMe. Поэтому проверяем оформление
+        # (короткая шапка + те самые 4 колонки) и, если совпало, отдельно
+        # сверяем сборку по трафарету.
+        atlas_comments = 0
+        atlas_header_seen = False
+        for line in lines:
+            if not line.strip():
+                continue
+            tokens = tuple(
+                t.strip().strip('"').lower()
+                for t in line.lstrip("#").strip().split("\t")
+            )
+            if tokens == _ATLAS_HEADER_TOKENS:
+                atlas_header_seen = True
+                break
+            if line.lstrip().startswith("#"):
+                atlas_comments += 1
+                continue
+            break
+        if atlas_header_seen and atlas_comments <= _ATLAS_MAX_COMMENT_LINES:
+            if _looks_like_grch38(path) is True:
+                return "atlas", 0.95
 
         # --- 4. MyHeritage -------------------------------------------------
         leading_comment_lines = 0
@@ -1108,6 +1290,11 @@ def _download_attempt(url: str, dest: Path) -> None:
                     bar.current = existing_size if resumed else 0
                 mode = "ab" if existing_size > 0 else "wb"
                 read_this_connection = 0
+                # Смещение, с которого пишет ИМЕННО это соединение: если
+                # тело окажется короче обещанного Content-Length, всё
+                # записанное этим соединением откатывается до этой позиции.
+                offset_at_start = existing_size
+                stream_ended = False
                 # Детект "залипшей" скорости: соединение формально живо
                 # (read() не падает по таймауту, данные идут), но скорость
                 # падает до единиц КБ/с — так выглядит троттлинг на стороне
@@ -1126,6 +1313,7 @@ def _download_attempt(url: str, dest: Path) -> None:
                                 f"обрыв соединения на {bar.current / 1024**2:.1f} МБ ({e})"
                             ) from e
                         if not chunk:
+                            stream_ended = True
                             break
                         f.write(chunk)
                         bar.update(len(chunk))
@@ -1143,6 +1331,32 @@ def _download_attempt(url: str, dest: Path) -> None:
                                 )
                             window_start = time.monotonic()
                             window_bytes = 0
+
+            # ⚠ КРИТИЧНО (фикс "референс скачался целиком, но pyfaidx
+            # падает на битой строке в середине файла"): прокси/зеркало
+            # может закрыть поток раньше времени и ДОПИСАТЬ в тело свой
+            # XML c ошибкой ("<Error><Code>ConnectionClosedException</Code>
+            # <Message>Premature end of Content-Length delimited message
+            # body (expected: 572360640; received: 17508937)…"). Для read()
+            # это обычные данные: они уходили в файл, existing_size
+            # пересчитывался от РАЗДУТОГО размера, следующий Range
+            # продолжал уже за мусором — и итоговый размер совпадал с
+            # Content-Length всего файла. Единственная проверка
+            # (final_size != total) такую порчу пропускала.
+            # Поэтому сверяем каждое соединение отдельно: если поток
+            # закончился, не отдав обещанный Content-Length, — откатываем
+            # файл до позиции начала этого соединения и уходим в ретрай.
+            if (stream_ended and content_length > 0
+                    and read_this_connection < content_length):
+                with open(dest, "r+b") as f:
+                    f.truncate(offset_at_start)
+                raise _IncompleteDownloadError(
+                    f"сервер оборвал поток: получено "
+                    f"{read_this_connection / 1024**2:.1f} МБ из обещанных "
+                    f"{content_length / 1024**2:.1f} МБ "
+                    f"(откатил файл до {offset_at_start / 1024**2:.1f} МБ, "
+                    f"чтобы в него не попал мусор)"
+                )
 
             existing_size = dest.stat().st_size
             if total and total > 0 and existing_size >= total:
@@ -1370,21 +1584,79 @@ def _download_and_gunzip_with_retries(
     ) from last_error
 
 
-def _sha256_of_file(path: Path, progress_cb: Optional[Callable[[float, str], None]] = None) -> str:
-    """Считает SHA-256 файла потоково (без загрузки целиком в память)."""
+# Признаки того, что в тело скачанного файла попал НЕ файл, а служебный
+# ответ прокси/зеркала (промт "Line length of fasta file is not consistent!
+# Inconsistent line found in >chr19 at line 38152550"): в середине
+# референса TopMed обнаружился XML вида "<Error><Code>
+# ConnectionClosedException</Code><Message>Premature end of Content-Length
+# delimited message body…</Message></Error>". Такой мусор не ломает ни
+# размер файла, ни его "гzip-ность" — он всплывает гораздо позже, уже
+# внутри pyfaidx, сообщением, по которому невозможно догадаться о причине.
+# Поэтому ищем его сразу, на том же проходе, что и SHA-256.
+_INJECTED_ERROR_MARKERS: tuple[bytes, ...] = (
+    b"<Error>",
+    b"<?xml",
+    b"<html",
+    b"<!DOCTYPE",
+    b"ConnectionClosedException",
+)
+_MARKER_OVERLAP = max(len(m) for m in _INJECTED_ERROR_MARKERS)
+
+
+def _sha256_of_file(
+    path: Path,
+    progress_cb: Optional[Callable[[float, str], None]] = None,
+    injected_out: Optional[list] = None,
+) -> str:
+    """
+    Считает SHA-256 файла потоково (без загрузки целиком в память).
+
+    injected_out: если передан список, то на этом же проходе файл
+        проверяется на служебные ответы прокси, случайно записанные внутрь
+        тела (см. _INJECTED_ERROR_MARKERS). Каждая находка добавляется как
+        (смещение_в_байтах, фрагмент) — отдельного чтения файла на 3 ГБ
+        для такой проверки не требуется.
+    """
     h = hashlib.sha256()
     total = path.stat().st_size or 1
     read = 0
+    tail = b""
     with path.open("rb") as f:
         while True:
             chunk = f.read(4 * 1024 * 1024)
             if not chunk:
                 break
             h.update(chunk)
+            if injected_out is not None:
+                window = tail + chunk
+                base = read - len(tail)
+                for marker in _INJECTED_ERROR_MARKERS:
+                    pos = window.find(marker)
+                    if pos != -1:
+                        injected_out.append((base + pos, window[pos:pos + 200]))
+                tail = window[-_MARKER_OVERLAP:]
             read += len(chunk)
             if progress_cb:
                 progress_cb(0.95 + 0.05 * min(read / total, 1.0), "Проверка целостности (SHA-256)...")
     return h.hexdigest()
+
+
+def _injected_error_message(path: Path, found: list) -> str:
+    """Текст ошибки для референса, внутрь которого попал ответ прокси."""
+    offset, snippet = found[0]
+    text = snippet.decode("utf-8", "replace").replace("\n", " ")
+    return (
+        f"Внутрь файла {path.name} попал служебный ответ прокси/зеркала, "
+        f"а не данные референса (смещение {offset} байт):\n"
+        f"    {text}\n\n"
+        f"Так выглядит обрыв закачки, который сервер \"дописал\" в тело "
+        f"ответа. Размер файла при этом совпадает с ожидаемым, поэтому "
+        f"обычные проверки его пропускают, а падает всё позже — при "
+        f"индексации FASTA.\n"
+        f"Удалите файл и его .sha256 и запустите заново, чтобы перекачать "
+        f"референс:\n"
+        f"    Remove-Item \"{path}\", \"{path}{REFERENCE_SHA256_SIDECAR_SUFFIX}\""
+    )
 
 
 def ensure_reference_genome(
@@ -1444,7 +1716,10 @@ def ensure_reference_genome(
     if ref_path.exists() and ref_path.stat().st_size >= REFERENCE_MIN_SIZE:
         print(f"✓ Референс найден: {ref_path.name} ({ref_path.stat().st_size / 1024**3:.2f} ГБ)")
         notify(0.9, "Проверка целостности (SHA-256)...")
-        actual_hash = _sha256_of_file(ref_path, progress_cb=notify)
+        injected: list = []
+        actual_hash = _sha256_of_file(ref_path, progress_cb=notify, injected_out=injected)
+        if injected:
+            raise RuntimeError(_injected_error_message(ref_path, injected))
         if sidecar_path.exists():
             expected_hash = sidecar_path.read_text(encoding="utf-8").strip()
             if actual_hash != expected_hash:
@@ -1503,7 +1778,10 @@ def ensure_reference_genome(
         )
 
     notify(0.95, "Проверка целостности (SHA-256)...")
-    actual_hash = _sha256_of_file(ref_path, progress_cb=notify)
+    injected = []
+    actual_hash = _sha256_of_file(ref_path, progress_cb=notify, injected_out=injected)
+    if injected:
+        raise RuntimeError(_injected_error_message(ref_path, injected))
     sidecar_path.write_text(actual_hash, encoding="utf-8")
     print(f"ℹ SHA-256 референса зафиксирован для последующих проверок: {actual_hash}")
 
@@ -2270,11 +2548,22 @@ def check_donor_cache(
     source: str,
     donors_root: Path = DONORS_DIR,
     panel: str = DEFAULT_PANEL,
+    eur_sample_count: Optional[int] = EUR_COUNT_UNCHECKED,
 ) -> list[Path]:
     """
     Единая точка правды для CLI (main()) и GUI (_check_donors): проверяет,
     что кэш доноров под donors_root/<source>/<panel>/ полон (23 файла: 1-22 + X) и
     что его chip_signature.txt совпадает с chip_signature текущего запуска.
+
+    eur_sample_count (промт "галочка «все доступные EUR-доноры»
+        игнорируется"): сколько донорских образцов ДОЛЖНО быть в кэше.
+        None — все доступные EUR из панели (~503), int — явное число,
+        EUR_COUNT_UNCHECKED (по умолчанию) — не проверять. Проверка нужна
+        потому, что размер донорской подвыборки НЕ входит в
+        chip_signature.txt: кэш на 20 образцах считался актуальным и при
+        включённой галочке "все доступные", этап скачивания доноров
+        пропускался целиком, и на MIS уезжали те же 20 образцов. См.
+        core/donor_cache.py.
 
     Возвращает список путей kgp_sub_{1..22,X}.vcf.gz при успехе.
     Бросает RuntimeError с понятной инструкцией (--source, --panel,
@@ -2393,8 +2682,30 @@ def check_donor_cache(
             f"перекачайте доноров заново:\n{download_cmd}"
         )
 
+    # Размер донорской подвыборки: chip_signature.txt описывает ЧИП, а не
+    # число образцов, поэтому совпадение сигнатуры ничего о нём не говорит.
+    verdict = eur_count_verdict(donors_dir, donor_vcfs[0], eur_sample_count)
+    if not verdict.ok:
+        wanted = (
+            f"все доступные ({verdict.expected})" if eur_sample_count is None
+            else str(verdict.expected)
+        )
+        logger.warning(
+            "⚠ Кэш доноров собран на %s образцах, запрошено %s (source=%s, panel=%s).",
+            verdict.cached, wanted, source, panel_key,
+        )
+        raise RuntimeError(
+            f"⚠ Кэш доноров (source={source}, panel={panel_key}) собран на "
+            f"{verdict.cached} донорских образцах, а запрошено: {wanted}. "
+            f"Сигнатура чипа совпадает, но число образцов в сигнатуру не "
+            f"входит — старые файлы не подходят под новую настройку и будут "
+            f"перекачаны (уже скачанные полные хромосомы, если включён общий "
+            f"кэш, переиспользуются).\nПапка: {donors_dir}\n{download_cmd}"
+        )
+
     logger.info(
-        "✓ Кэш доноров (%s/%s) актуален: signature=%s", source, panel_key, chip_signature,
+        "✓ Кэш доноров (%s/%s) актуален: signature=%s, образцов=%s",
+        source, panel_key, chip_signature, verdict.cached,
     )
     return donor_vcfs
 
@@ -3061,7 +3372,10 @@ def main() -> None:
     # об этом лучше сразу.
     csv_for_parsing = Path(args.csv)
     if args.source in _SOURCES_NEEDING_CONVERSION:
-        print("[0a/7] Приведение исходного файла к оформлению 23andMe v3")
+        if args.source == "atlas":
+            print("[0a/7] Перенос координат GRCh38 -> GRCh37 и оформление 23andMe v3")
+        else:
+            print("[0a/7] Приведение исходного файла к оформлению 23andMe v3")
         try:
             # output_dir — папка ЭТОГО запуска (output/runs/<имя>), а не
             # общий корень output/: конвертированный файл принадлежит
@@ -3069,7 +3383,7 @@ def main() -> None:
             csv_for_parsing, conversion_stats = prepare_source_file(
                 args.source, Path(args.csv), output_dir, args.template,
             )
-        except AncestryConvertError as e:
+        except (AncestryConvertError, AtlasConvertError) as e:
             sys.exit(f"ОШИБКА: {e}")
         print(f"  {conversion_stats.summary()}")
         if not conversion_stats.skipped:

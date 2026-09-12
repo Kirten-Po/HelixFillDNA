@@ -332,6 +332,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Set, Tuple
 
+from core.donor_cache import EUR_COUNT_UNCHECKED, eur_count_verdict
 from core.network_utils import (
     ensure_network_ready, which_curl_ignoring_dir, warn_if_conflicting_curl,
 )
@@ -2789,6 +2790,68 @@ def process_chromosome_auto(
 # ---------------------------------------------------------------------------
 # Инвалидация устаревшего кэша (Задача 1, п.7)
 # ---------------------------------------------------------------------------
+def _purge_donor_cache(output_dir: Path) -> None:
+    """Удаляет отфильтрованных доноров и привязанные к ним служебные файлы."""
+    for chrom in DONOR_CHROMS:
+        (output_dir / f"kgp_sub_{chrom}.vcf.gz").unlink(missing_ok=True)
+        (output_dir / f"kgp_sub_{chrom}.vcf.gz.tbi").unlink(missing_ok=True)
+    for name in _SIGNATURE_SCOPED_STATIC_FILES:
+        (output_dir / name).unlink(missing_ok=True)
+    # Имя файла со списком EUR-образцов зависит от eur_sample_count
+    # (eur20.txt/eur120.txt/...) — фиксированный список имён его не
+    # покрывает, чистим через glob (включая per-chrom eur{N}_chr{C}.txt).
+    for stale_eur_file in output_dir.glob("eur*.txt"):
+        stale_eur_file.unlink(missing_ok=True)
+
+
+def _invalidate_donor_cache_by_sample_count(
+    output_dir: Path,
+    eur_sample_count: Optional[int] = EUR_COUNT_UNCHECKED,
+    progress_cb: Optional[Callable[[float, str], None]] = None,
+) -> bool:
+    """
+    Удаляет кэш доноров, собранный на ДРУГОМ числе донорских образцов.
+
+    Промт "галочка «все доступные EUR-доноры» игнорируется": число
+    образцов не входит в chip_signature.txt, поэтому кэш на 20 образцах
+    проходил проверку сигнатуры, а process_chromosome() видел готовые
+    kgp_sub_*.vcf.gz и печатал "chr1 уже готов" — то есть включённая
+    галочка не приводила ни к какой перекачке. Проверяем по фактическому
+    числу колонок в заголовке донорского файла (см. core/donor_cache.py),
+    а не по служебным eur{N}.txt: они могли не дожить до этого запуска.
+
+    Возвращает True, если кэш действительно был удалён.
+    """
+    reference = next(
+        (output_dir / f"kgp_sub_{chrom}.vcf.gz"
+         for chrom in DONOR_CHROMS
+         if (output_dir / f"kgp_sub_{chrom}.vcf.gz").exists()),
+        None,
+    )
+    if reference is None:
+        return False
+
+    verdict = eur_count_verdict(output_dir, reference, eur_sample_count)
+    if verdict.ok:
+        return False
+
+    wanted = (
+        f"все доступные ({verdict.expected})" if eur_sample_count is None
+        else str(verdict.expected)
+    )
+    print(
+        f"⚠ Кэш доноров в {output_dir} собран на {verdict.cached} образцах, "
+        f"а запрошено: {wanted} — удаляю отфильтрованных доноров, чтобы они "
+        f"были собраны заново с нужным числом образцов. Полные хромосомы "
+        f"1000 Genomes из общего кэша (если он включён) при этом "
+        f"переиспользуются, заново качать их не нужно."
+    )
+    if progress_cb:
+        progress_cb(0.0, f"Кэш на {verdict.cached} образцах — пересборка...")
+    _purge_donor_cache(output_dir)
+    return True
+
+
 def _invalidate_stale_donor_cache(
     output_dir: Path,
     expected_signature: str,
@@ -2824,16 +2887,7 @@ def _invalidate_stale_donor_cache(
     if progress_cb:
         progress_cb(0.0, "Обнаружен кэш другого чипа — очистка...")
 
-    for chrom in DONOR_CHROMS:
-        (output_dir / f"kgp_sub_{chrom}.vcf.gz").unlink(missing_ok=True)
-        (output_dir / f"kgp_sub_{chrom}.vcf.gz.tbi").unlink(missing_ok=True)
-    for name in _SIGNATURE_SCOPED_STATIC_FILES:
-        (output_dir / name).unlink(missing_ok=True)
-    # Имя файла со списком EUR-образцов зависит от eur_sample_count
-    # (eur20.txt/eur120.txt/...) — фиксированный список имён его не
-    # покрывает, чистим через glob.
-    for stale_eur_file in output_dir.glob("eur*.txt"):
-        stale_eur_file.unlink(missing_ok=True)
+    _purge_donor_cache(output_dir)
     return True
 
 
@@ -2990,6 +3044,13 @@ def download_donors_for_chip(
     # _probe_bcftools_remote_support() ниже просто вернёт False, и
     # прогон продолжится через полное скачивание, как и раньше.
     ensure_network_ready(htslib.bin_dir)
+
+    # Кэш на другом числе донорских образцов так же непригоден, как кэш
+    # другого чипа: без этой проверки process_chromosome() скажет "chr1 уже
+    # готов" и включённая галочка "все доступные EUR-доноры" не приведёт ни
+    # к какой перекачке (см. _invalidate_donor_cache_by_sample_count()).
+    _invalidate_donor_cache_by_sample_count(
+        output_dir, eur_sample_count, progress_cb)
 
     expected_signature = _extract_signature_from_positions_json(positions_json)
     if expected_signature:

@@ -470,6 +470,10 @@ MODE_ADVANCED = "Продвинутые настройки"
 # придётся импутировать.
 SIMPLE_FORMAT_BY_SOURCE = {
     "ftdna": "v3", "myheritage": "v5", "ancestry": "v3", "vcf": "v3",
+    # Атлас — современный чип (GSA-семейство): трафарет Генотека покрывает
+    # 90,6 % его позиций напрямую (проверено на реальном файле: 563 375 из
+    # 621 566), v5 — 82,7 %, v3 — 18,7 %.
+    "atlas": "genotek",
 }
 SIMPLE_RSQ = "0.30"          # стандартный порог MIS
 # Нижняя граница подбора порога Rsq — дублирует core.rsq_tuner.RSQ_FLOOR
@@ -643,6 +647,7 @@ import main as pipeline
 import download_donors
 from adapters.ftdna_v3 import ReferenceGenome
 from core import archive_utils
+from core import donor_cache
 from core import network_utils
 from core import updater
 from core import preflight
@@ -3621,7 +3626,21 @@ class App(ctk.CTk):
         if panel is None:
             panel = self._get_panel_key()
         donors_root = PROJECT_ROOT / "donors"
-        return pipeline.check_donor_cache(chip_signature, source, donors_root, panel=panel)
+        # Промт "галочка «все доступные EUR-доноры» игнорируется": число
+        # донорских образцов НЕ входит в chip_signature.txt, поэтому кэш,
+        # собранный когда-то на 20 образцах, проходил проверку сигнатуры —
+        # этап скачивания доноров пропускался целиком, и включённая галочка
+        # молча не работала. Передаём желаемое число здесь, чтобы
+        # несовпадение приводило к обычному диалогу "Доноры устарели —
+        # скачать?", а не оставалось незамеченным.
+        try:
+            eur_sample_count = self._get_eur_sample_count()
+        except (ValueError, AttributeError):
+            eur_sample_count = donor_cache.EUR_COUNT_UNCHECKED
+        return pipeline.check_donor_cache(
+            chip_signature, source, donors_root, panel=panel,
+            eur_sample_count=eur_sample_count,
+        )
 
     # -----------------------------------------------------------------------
     # Задача 1: автопредложение скачать доноров через GUI
@@ -4456,10 +4475,23 @@ class App(ctk.CTk):
                 # и загрузить в Генотек как есть, не дожидаясь импутации.
                 csv_for_parsing = csv_path
                 if source in pipeline._SOURCES_NEEDING_CONVERSION:
-                    self.after(0, self._set_subprogress, 1, 0.0,
-                               "Приведение к формату 23andMe v3...")
+                    stage0_text = (
+                        "Перенос координат GRCh38 -> GRCh37..."
+                        if source == "atlas"
+                        else "Приведение к формату 23andMe v3..."
+                    )
+                    self.after(0, self._set_subprogress, 1, 0.0, stage0_text)
+
+                    def stage0_progress(frac: float, text: str) -> None:
+                        self.after(0, self._set_subprogress, 1, frac, text)
+
                     csv_for_parsing, conversion_stats = pipeline.prepare_source_file(
                         source, csv_path, output_dir, Path(self.tmpl_tf.get()),
+                        project_root=PROJECT_ROOT,
+                        # Для 'atlas' Этап 0 может ещё и скачать chain-файл
+                        # hg38ToHg19 (десятки МБ) — без прогресса это
+                        # выглядело бы как зависшее приложение.
+                        progress_cb=stage0_progress,
                     )
                     print(f"✓ Этап 0: {conversion_stats.summary()}")
                     if not conversion_stats.skipped:

@@ -216,6 +216,12 @@ def _read_template_header(template_path: Optional[Path]) -> list[str]:
         return list(_FALLBACK_HEADER)
 
 
+#: Публичный псевдоним: тем же способом берёт '#'-шапку трафарета
+#: core/atlas_convert.py (Этап 0 для источника «Атлас»), чтобы шапка
+#: конвертированных файлов была одна и та же независимо от источника.
+read_template_header = _read_template_header
+
+
 # ---------------------------------------------------------------------------
 def convert_ancestry_to_23andme_v3(
     src: Path,
