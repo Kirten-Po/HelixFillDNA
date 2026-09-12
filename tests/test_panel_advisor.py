@@ -87,6 +87,37 @@ def test_light_rare_tail_recommends_hrc_even_with_many_missing(tmp_path):
     )
 
 
+def test_gsa_template_forces_topmed_despite_light_tail(tmp_path):
+    """
+    Шаблон genotek/v5 перевешивает умеренный редкий хвост: nocall
+    возникает на позициях ШАБЛОНА, а не входного чипа. Реальный случай —
+    FTDNA (хвост 9,89 %) в шаблон v5 дал 11,97 % nocall на HRC.
+    """
+    afs = [0.001] * 3 + [0.4] * 97           # 3 % редких — сам по себе HRC
+    comp = pa.analyse_chip(_make_donor_dir(tmp_path, afs), bcftools_path=None)
+    assert pa.recommend_panel(comp).panel == pa.PANEL_HRC, "контроль"
+    for tmpl in ("genotek", "v5"):
+        rec = pa.recommend_panel(comp, template_kind=tmpl)
+        assert rec.panel == pa.PANEL_TOPMED, tmpl
+        assert any("GSA" in r for r in rec.reasons), tmpl
+
+
+def test_v3_template_keeps_hrc(tmp_path):
+    """v3 покрывается HRC хорошо (1,7-2,4 % nocall) — гнать его на TopMed
+    через круговой лифтовер незачем."""
+    afs = [0.001] * 3 + [0.4] * 97
+    comp = pa.analyse_chip(_make_donor_dir(tmp_path, afs), bcftools_path=None)
+    assert pa.recommend_panel(comp, template_kind="v3").panel == pa.PANEL_HRC
+
+
+def test_borderline_rare_tail_now_recommends_topmed(tmp_path):
+    """9 % редких: ниже прежнего порога 10.0, выше нынешнего 8.0."""
+    afs = [0.001] * 9 + [0.4] * 91
+    comp = pa.analyse_chip(_make_donor_dir(tmp_path, afs), bcftools_path=None)
+    assert 8.0 <= comp.rare_pct < 10.0, comp.rare_pct
+    assert pa.recommend_panel(comp).panel == pa.PANEL_TOPMED
+
+
 def test_non_european_sample_forces_topmed(tmp_path):
     """
     Неевропейское происхождение перевешивает состав чипа: подвыборка HRC

@@ -4090,6 +4090,10 @@ class App(ctk.CTk):
         self.stage_lbl.configure(text="Анализ исходника (пре-флайт)...")
         csv_path = Path(self.input_tf.get())
         source = self._get_source_key()
+        # Формат читаем ЗДЕСЬ, в главном потоке: _worker() ниже трогать
+        # виджеты не имеет права, а шаблон вывода — решающий сигнал для
+        # выбора панели (см. TOPMED_TEMPLATES в core/panel_advisor.py).
+        format_key = self._get_format_key()
         tmpl_raw = self.tmpl_tf.get().strip()
         tmpl_path = Path(tmpl_raw) if tmpl_raw else None
         if tmpl_path is not None and not tmpl_path.is_file():
@@ -4122,7 +4126,9 @@ class App(ctk.CTk):
                         bcftools_path=(pipeline.HtslibTools(bin_dir).bcftools_path
                                        if bin_dir else None),
                     )
-                    rec = panel_advisor.recommend_panel(comp)
+                    rec = panel_advisor.recommend_panel(
+                        comp, template_kind=format_key,
+                    )
                     _log(panel_advisor.format_recommendation(rec))
                 else:
                     _log("ℹ Состав чипа не посчитан: кэш доноров ещё не "

@@ -420,7 +420,13 @@ REFERENCE_PANELS = {
         ),
     },
 }
-DEFAULT_PANEL = "hrc"
+# По умолчанию TopMed, а не HRC: при неизвестном составе чипа падать
+# надо на панель, которая покрывает больше. Замер на собранных файлах —
+# HRC оставляет 6-12 % nocall на шаблонах genotek/v5 против ~1,5 %
+# ожидаемых у TopMed (см. TOPMED_TEMPLATES в core/panel_advisor.py).
+# Цена — лифтовер GRCh37 -> GRCh38 и обратно плюс повторное скачивание
+# донорских хромосом в сборке 38: папка доноров разделена по панелям.
+DEFAULT_PANEL = "topmed"
 
 # Задача 3: автозагрузка референсного генома (обратная совместимость —
 # старые константы теперь являются алиасами на конфигурацию HRC-панели;
@@ -3262,7 +3268,9 @@ def run_preflight(args) -> int:
                 cache, bcftools_path=HTSLIB.bcftools_path if HTSLIB else None,
             )
             print(panel_advisor.format_recommendation(
-                panel_advisor.recommend_panel(comp)
+                panel_advisor.recommend_panel(
+                    comp, template_kind=getattr(args, "format", None),
+                )
             ))
     except Exception as e:  # noqa: BLE001
         print(f"ℹ Состав чипа не посчитан: {e}")
