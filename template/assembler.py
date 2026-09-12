@@ -89,11 +89,21 @@ def load_imputed_genotypes(
     rsq_threshold: float = 0.30,
     bcftools_path: str | None = None,
     tabix_path: str | None = None,
+    rsq_out: dict[str, float] | None = None,
 ) -> dict[str, str]:
     """
     Загружает импутированные генотипы из chr*.dose.vcf.gz.
     Автоматически читает chr*.info.gz и отбрасывает варианты с Rsq < rsq_threshold.
     Обрабатывает хромосомы 1-22, X, Y, MT.
+
+    rsq_out (промт "подбор Rsq под целевой call rate"): если передан
+    словарь, в него кладётся Rsq КАЖДОГО принятого генотипа под тем же
+    ключом "<хромосома>_<позиция>". Это позволяет один раз прочитать дозы
+    с низким порогом, а потом посчитать зависимость итоговой заполняемости
+    от порога БЕЗ повторного запуска bcftools по всем хромосомам — см.
+    core/rsq_tuner.py. Позиции без записи в chr*.info.gz (TYPED_ONLY —
+    реальные измерения чипа) получают 1.0, ровно как и при фильтрации
+    ниже: фильтровать в них нечего.
     """
     imputed_dir = Path(imputed_dir)
     if not imputed_dir.is_dir():
@@ -113,6 +123,7 @@ def load_imputed_genotypes(
             _load_one_dose_file(
                 vcf_path, info_path, chrom, genotypes, panel_set,
                 rsq_threshold, bcftools, tabix, sample_name, imputed_dir,
+                rsq_out=rsq_out,
             )
 
     logger.info("Загружено %d импутированных генотипов (Rsq >= %.2f)", len(genotypes), rsq_threshold)
@@ -157,6 +168,7 @@ def _load_one_dose_file(
     tabix: str,
     sample_name: str,
     imputed_dir: Path,
+    rsq_out: dict[str, float] | None = None,
 ) -> None:
     """Тело прежнего цикла по хромосомам, вынесенное в отдельную функцию:
     для X их теперь может быть несколько файлов на одну хромосому (см.
@@ -340,6 +352,8 @@ def _load_one_dose_file(
             genotype = a1 + a2
             key = f"{c_norm}_{p_int}"
             genotypes[key] = genotype
+            if rsq_out is not None:
+                rsq_out[key] = rsq
         except (IndexError, ValueError):
             continue
 
@@ -373,6 +387,81 @@ def load_measured_genotypes(variants: list) -> dict[str, str]:
         genotypes[key] = genotype
     logger.info("Загружено %d реальных измерений", len(genotypes))
     return genotypes
+
+
+# ---------------------------------------------------------------------------
+# Переносы строк по формату вывода
+# ---------------------------------------------------------------------------
+#: Форматы, у которых строки заканчиваются CRLF. Раньше это была жёстко
+#: зашитая в двух местах проверка `format_version == "v5"`, и любой новый
+#: формат молча получал LF — а validate_output() тут же объявлял такой
+#: файл невалидным ("CRLF/LF не соответствует формату"). Один список на
+#: оба места убирает целый класс таких расхождений.
+CRLF_FORMATS: frozenset = frozenset({"v5", "genotek"})
+
+
+def line_ending_for(format_version: str) -> str:
+    return "\r\n" if format_version in CRLF_FORMATS else "\n"
+
+
+# ---------------------------------------------------------------------------
+# Хромосомы, которые в итоговом файле всегда остаются без вызовов
+# ---------------------------------------------------------------------------
+#: Y-хромосома. Она НЕ импутируется: на сервер уходят только 1-22 и X
+#: (см. core/pure_python_core.py::UPLOAD_CHROMS), поэтому в итоговый файл
+#: Y попадает единственным путём — прямыми измерениями чипа, которые
+#: подставляет load_measured_genotypes(). Новые экспорты MyHeritage такие
+#: измерения содержат, и в собранном файле блок Y (он идёт предпоследним,
+#: между X и MT) внезапно оказывался заполнен.
+#:
+#: Строки Y при этом НЕ удаляются: итоговый файл обязан построчно
+#: повторять трафарет — это проверяет validate_output() (structure_identical),
+#: и на этом же держится совместимость с форматом 23andMe. Позиции
+#: остаются на своих местах со значением "--", то есть «не измерено».
+#:
+#: ⚠ Цена решения, о которой стоит помнить: у МУЖСКОГО образца это
+#: настоящие измерения чипа, и по итоговому файлу Y-гаплогруппу после
+#: такой очистки определить уже нельзя — для этого нужен исходный файл.
+BLANKED_CHROMS: frozenset = frozenset({"Y"})
+
+
+def blank_chromosomes(
+    genotypes: dict[str, str],
+    chroms: frozenset = BLANKED_CHROMS,
+) -> tuple[dict[str, str], int]:
+    """
+    Убирает из словаря генотипов все позиции указанных хромосом.
+
+    Возвращает (новый словарь, сколько позиций убрано). Ключи словаря —
+    "<хромосома>_<позиция>" в каноническом виде (без префикса "chr"), как
+    их формируют load_measured_genotypes()/load_imputed_genotypes(); на
+    всякий случай префикс здесь всё равно снимается — после обратного
+    лифтовера с панели TopMed ключи проходят через несколько рук.
+
+    Удаление из словаря, а не запись "--" в файл, выбрано сознательно:
+    assemble_final() и так подставляет "--" всему, чего нет в словаре, —
+    то есть достаточно, чтобы позиции там не было, и вся остальная логика
+    (в том числе подбор порога Rsq, который считает заполняемость по тем
+    же словарям) видит ровно то же, что окажется в файле.
+    """
+    if not chroms:
+        return genotypes, 0
+    kept: dict[str, str] = {}
+    removed = 0
+    for key, value in genotypes.items():
+        chrom = key.rsplit("_", 1)[0]
+        if chrom.lower().startswith("chr") and len(chrom) > 3:
+            chrom = chrom[3:]
+        if chrom.upper() in chroms:
+            removed += 1
+            continue
+        kept[key] = value
+    if removed:
+        logger.info(
+            "Очищено позиций хромосом %s: %d — в итоговом файле они "
+            "останутся как '--'", ",".join(sorted(chroms)), removed,
+        )
+    return kept, removed
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +524,7 @@ def assemble_final(skeleton: list[SkeletonRow], genotypes: dict[str, str],
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    line_ending = "\r\n" if format_version == "v5" else "\n"
+    line_ending = line_ending_for(format_version)
 
     header_lines = (
         extract_template_header(template_path) if template_path is not None
@@ -486,7 +575,7 @@ def validate_output(output_path: Path, template_path: Path, format_version: str 
         errors.append(f"Некорректное число полей: {fields_per_line}")
 
     crlf_count = sum(1 for l in output_data if l.endswith("\r\n"))
-    crlf_expected = format_version == "v5"
+    crlf_expected = format_version in CRLF_FORMATS
     crlf_match = (crlf_count == total_lines) if crlf_expected else (crlf_count == 0)
     if not crlf_match:
         errors.append(f"CRLF/LF не соответствует формату {format_version}")

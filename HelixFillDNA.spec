@@ -25,6 +25,24 @@ ctk_datas, ctk_binaries, ctk_hidden = collect_all("customtkinter")
 pyfaidx_datas, pyfaidx_binaries, pyfaidx_hidden = collect_all("pyfaidx")
 
 # ---------------------------------------------------------------------------
+# certifi — запасной набор корневых сертификатов (промт "SSLError: not enough
+# data: cadata does not contain a certificate").
+#
+# На Windows с битым хранилищем корневых сертификатов ssl.create_default_context()
+# падает ещё до открытия сокета; core/network_utils.py::make_ssl_context()
+# обходит это, передавая cafile= явно, и ищет его в том числе через
+# certifi.where(). Чтобы этот путь работал в собранном exe, данные certifi
+# должны попасть в сборку — bin/cacert.pem мы возим сами, но он там может
+# отсутствовать (первый запуск, ручная сборка, урезанный дистрибутив).
+# collect_all вместо collect_data_files: заодно тянет сам модуль как
+# hiddenimport, поскольку он импортируется лениво, внутри функции.
+# ---------------------------------------------------------------------------
+try:
+    certifi_datas, certifi_binaries, certifi_hidden = collect_all("certifi")
+except Exception:
+    certifi_datas, certifi_binaries, certifi_hidden = [], [], []
+
+# ---------------------------------------------------------------------------
 # Данные приложения:
 #   - bin/  -> все htslib-бинарники и DLL (bcftools.exe/tabix.exe/bgzip.exe +
 #     их зависимости + cacert.pem) — код ищет их по --bin-dir/PROJECT_ROOT/"bin",
@@ -49,11 +67,12 @@ app_datas = [
 a = Analysis(
     ["gui/app.py"],
     pathex=[PROJECT_ROOT],
-    binaries=ctk_binaries + pyfaidx_binaries,
-    datas=app_datas + ctk_datas + pyfaidx_datas,
+    binaries=ctk_binaries + pyfaidx_binaries + certifi_binaries,
+    datas=app_datas + ctk_datas + pyfaidx_datas + certifi_datas,
     hiddenimports=[
         *ctk_hidden,
         *pyfaidx_hidden,
+        *certifi_hidden,
         # Модули проекта, импортируемые динамически/косвенно (main.py
         # делает `import main as pipeline` из gui/app.py, но сами
         # subpackage-и adapters/core/template тоже стоит перечислить явно
@@ -64,11 +83,19 @@ a = Analysis(
         "adapters.ftdna_v3",
         "adapters.myheritage_v5",
         "adapters.vcf_source",
+        "adapters.ancestry_v2",
         "core",
+        "core.ancestry_convert",
+        "core.download_watch",
         "core.archive_utils",
         "core.liftover",
+        "core.metrics_log",
         "core.network_utils",
+        "core.panel_advisor",
+        "core.preflight",
         "core.pure_python_core",
+        "core.rsq_tuner",
+        "core.updater",
         "template",
         "template.assembler",
         "template.skeleton",

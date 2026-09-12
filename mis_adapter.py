@@ -5,10 +5,16 @@ mis_adapter.py
 скачивание и распаковка результатов.
 """
 from __future__ import annotations
+import atexit
+import hashlib
+import json
 import logging
+import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 import webbrowser
 import zipfile
 from pathlib import Path
@@ -20,6 +26,380 @@ from core.archive_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ===========================================================================
+# Скачивание архивов результатов MIS
+#
+# Разбор реального отказа (жалоба "chr_16 качается по 11 КБ/с, то
+# появляется, то пропадает; потом [WinError 32] файл занят другим
+# процессом"):
+#
+#   1. curl запускался как `curl -sL <url> -o <финальное имя>`:
+#      * `-s` глушит сообщения об ошибках, поэтому до пользователя
+#        долетало только "returned non-zero exit status 56" — без единого
+#        слова о том, что 56 означает обрыв приёма данных;
+#      * без `-f` HTTP-ошибка (404, 500, страница логина) не считается
+#        ошибкой: curl пишет тело ответа в файл и возвращает 0;
+#      * без `--speed-limit` соединение, просевшее до 11 КБ/с, живёт
+#        вечно — 250 МБ на такой скорости это больше шести часов, и со
+#        стороны это выглядит как "зависло";
+#      * без `-C -` каждый обрыв начинал файл заново, с нуля;
+#      * запись сразу в финальное имя означает, что оборванная закачка
+#        остаётся на диске под именем настоящего архива.
+#   2. Дочерний curl.exe не убивался при закрытии окна: поток GUI —
+#      daemon, Python при выходе его снимает, но ДОЧЕРНИЙ ПРОЦЕСС на
+#      Windows продолжает жить и писать в chr_16.zip. Отсюда и "две
+#      хромосомы качаются одновременно" (скачивание здесь строго
+#      последовательное — второй писатель был осиротевшим curl от
+#      прошлого запуска), и [WinError 32] на следующем запуске: файл
+#      занят живым процессом, а `dest.unlink()` не был защищён и ронял
+#      весь Шаг 3.
+#   3. Файлы, уже лежащие в папке, пропускались по признаку "валидный
+#      ZIP" — без всякой привязки к ЗАДАНИЮ. Перезапустив задание на MIS
+#      (новый job id, новый пароль), пользователь получал старые архивы,
+#      которые честно проходили проверку целостности, пропускались как
+#      "уже скачанные" — и падали на распаковке с "Wrong password" по
+#      всем 23 сразу.
+#
+# Ниже — фиксы всех трёх пунктов.
+# ===========================================================================
+
+#: Расшифровка кодов возврата curl. Голое "exit status 56" не говорит
+#: пользователю ничего, а причина отказа у этих кодов разная настолько,
+#: что и действия разные: 56 — чинить связь, 22 — ссылка устарела, 60 —
+#: сертификаты.
+_CURL_EXIT_HINTS: dict[int, str] = {
+    6: "не удалось определить адрес сервера (DNS)",
+    7: "не удалось подключиться к серверу",
+    18: "передача оборвалась, файл получен не целиком",
+    22: "сервер вернул HTTP-ошибку — обычно это истёкшая ссылка "
+        "(результаты на MIS хранятся ~3 дня) или неверный адрес",
+    23: "не удалось записать файл на диск (нет места или нет прав)",
+    28: "истёк таймаут: соединение слишком долго молчало или скорость "
+        "надолго упала почти до нуля",
+    33: "сервер не поддерживает докачку с середины файла",
+    35: "ошибка установки защищённого соединения (TLS)",
+    52: "сервер ответил пустым ответом",
+    55: "не удалось отправить данные в сеть",
+    56: "обрыв приёма данных: соединение разорвано на середине закачки",
+    60: "сертификат сервера не проверен — обычно это антивирус с "
+        "перехватом HTTPS или повреждённое хранилище сертификатов Windows",
+}
+
+
+def curl_error_text(code: int, stderr: str = "") -> str:
+    """Человекочитаемое описание отказа curl вместо голого кода."""
+    hint = _CURL_EXIT_HINTS.get(code)
+    tail = (stderr or "").strip().splitlines()
+    detail = tail[-1].strip() if tail else ""
+    parts = [f"curl завершился с кодом {code}"]
+    if hint:
+        parts.append(hint)
+    if detail:
+        parts.append(detail)
+    return ": ".join(parts[:2]) + (f" ({detail})" if detail and hint else "")
+
+
+# ---------------------------------------------------------------------------
+# Реестр запущенных curl-процессов
+#
+# Без него дочерний curl.exe переживает закрытие окна и продолжает писать
+# в файл результатов — именно так возникает [WinError 32] "файл занят
+# другим процессом" на СЛЕДУЮЩЕМ запуске и вторая "качающаяся" строка в
+# панели прогресса. subprocess.run() тут не годится вовсе: он не отдаёт
+# наружу объект процесса, а значит убить его некому.
+# ---------------------------------------------------------------------------
+_ACTIVE_CURLS: set[subprocess.Popen] = set()
+_ACTIVE_CURLS_LOCK = threading.Lock()
+
+
+def _register_curl(proc: subprocess.Popen) -> None:
+    with _ACTIVE_CURLS_LOCK:
+        _ACTIVE_CURLS.add(proc)
+
+
+def _unregister_curl(proc: subprocess.Popen) -> None:
+    with _ACTIVE_CURLS_LOCK:
+        _ACTIVE_CURLS.discard(proc)
+
+
+def kill_active_curls() -> int:
+    """
+    Убивает все запущенные этим процессом закачки. Вызывается на выходе
+    (atexit) и при отмене пользователем. Возвращает число убитых.
+    """
+    with _ACTIVE_CURLS_LOCK:
+        procs = list(_ACTIVE_CURLS)
+    killed = 0
+    for proc in procs:
+        if proc.poll() is not None:
+            continue
+        try:
+            proc.kill()
+            killed += 1
+        except OSError:
+            pass
+    return killed
+
+
+atexit.register(kill_active_curls)
+
+
+class DownloadCancelled(RuntimeError):
+    """Пользователь отменил скачивание результатов."""
+
+
+class FileLockedError(RuntimeError):
+    """Файл держит другой процесс — почти всегда осиротевший curl.exe."""
+
+
+def _locked_file_message(path: Path, err: Exception) -> str:
+    return (
+        f"Файл {path.name} занят другим процессом и его нельзя ни удалить, "
+        f"ни перезаписать ({err}).\n\n"
+        f"Почти наверняка это curl.exe, оставшийся от предыдущего запуска: "
+        f"он продолжает медленно докачивать этот же архив, даже если окно "
+        f"программы было закрыто.\n\n"
+        f"Что сделать: откройте Диспетчер задач (Ctrl+Shift+Esc), вкладка "
+        f"«Подробности», снимите все процессы curl.exe — и нажмите "
+        f"«Скачать результаты» ещё раз. Эта версия программы больше не "
+        f"оставляет таких процессов после себя."
+    )
+
+
+def _safe_unlink(path: Path) -> None:
+    """
+    Удаление с внятной ошибкой вместо голого [WinError 32].
+
+    Раньше `dest.unlink(missing_ok=True)` на занятом файле выбрасывал
+    PermissionError, который никто не ловил, и весь Шаг 3 падал с
+    сообщением "[WinError 32] Процесс не может получить доступ к файлу" —
+    без единого намёка на то, ЧТО за процесс и что с этим делать.
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except PermissionError as e:
+        raise FileLockedError(_locked_file_message(path, e)) from e
+    except OSError as e:
+        raise MISAdapterError(f"Не удалось удалить {path}: {e}") from e
+
+
+# ---------------------------------------------------------------------------
+# Манифест скачивания: какой архив от какого задания
+# ---------------------------------------------------------------------------
+DOWNLOAD_MANIFEST_NAME = "download_manifest.json"
+
+#: Сколько раз подряд пытаться скачать ОДИН файл, прежде чем признать
+#: неудачу. Раньше цикл повторов был `while True` без счётчика: на
+#: нестабильном канале пользователь мог до бесконечности жать «Да» в
+#: диалоге «повторить скачивание этого файла?», каждый раз начиная файл с
+#: нуля. Теперь попытки считаются, а докачка идёт с места обрыва.
+MAX_FILE_ATTEMPTS = 3
+
+
+def job_id_from_urls(urls: list[str]) -> str:
+    """
+    Отпечаток задания MIS — по набору ссылок на архивы. Ссылки содержат
+    идентификатор задания, поэтому два разных запуска на сервере дают
+    разный отпечаток, а повторный запуск программы для ТОГО ЖЕ задания —
+    тот же самый.
+    """
+    h = hashlib.sha1()
+    for url in sorted(urls):
+        h.update(url.encode("utf-8", errors="replace"))
+        h.update(b"\n")
+    return h.hexdigest()[:16]
+
+
+def read_manifest(results_dir: Path) -> dict:
+    try:
+        data = json.loads((Path(results_dir) / DOWNLOAD_MANIFEST_NAME)
+                          .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_manifest(results_dir: Path, manifest: dict) -> None:
+    try:
+        (Path(results_dir) / DOWNLOAD_MANIFEST_NAME).write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
+    except OSError as e:
+        logger.debug("Не удалось записать манифест скачивания: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Один файл: скачивание с докачкой, отменой и защитой от залипания
+# ---------------------------------------------------------------------------
+#: Ниже этой скорости (байт/с), продержавшейся _STALL_SECONDS, соединение
+#: считается залипшим и обрывается — чтобы сработала докачка с другого
+#: соединения, а не тянулись сутки. Живой пример: chr_16.zip шёл на
+#: 11 КБ/с; 250 МБ на такой скорости — больше шести часов, и со стороны
+#: это неотличимо от зависшей программы.
+_MIN_SPEED_BYTES = 20 * 1024
+_STALL_SECONDS = 60
+#: Пауза между опросами процесса — на неё же завязана реакция на отмену.
+_POLL_SECONDS = 0.5
+
+
+def _curl_base_args() -> list[str]:
+    return [
+        "curl",
+        # -s глушит прогресс-бар, -S ВОЗВРАЩАЕТ сообщения об ошибках
+        # (раньше стоял голый -s, и до пользователя долетал только код
+        # возврата), -f делает HTTP-ошибку настоящей ошибкой, а не
+        # молча скачанной страницей с текстом ошибки вместо архива.
+        "-sSfL",
+        "--connect-timeout", "30",
+        "--speed-limit", str(_MIN_SPEED_BYTES),
+        "--speed-time", str(_STALL_SECONDS),
+        "--retry", "3",
+        "--retry-delay", "3",
+        "--retry-connrefused",
+    ]
+
+
+def _run_curl(args: list[str], cancel_check: Optional[Callable[[], bool]] = None,
+              ) -> tuple[int, str]:
+    """
+    Запускает curl как Popen (а не subprocess.run) по двум причинам:
+    процесс надо уметь УБИТЬ по отмене и на выходе из приложения, и надо
+    успевать реагировать на отмену, пока идёт многоминутная закачка.
+
+    Возвращает (код возврата, stderr).
+    """
+    try:
+        proc = subprocess.Popen(
+            # stdout в DEVNULL: с "-o файл" curl в него ничего не пишет, а
+            # неопустошаемый PIPE — это потенциальный дедлок на большом
+            # выводе. stderr нужен: в нём текст ошибки, ради которого и
+            # добавлен флаг -S.
+            args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, errors="replace",
+        )
+    except FileNotFoundError as e:
+        raise MISAdapterError(
+            "curl не найден в системе. На Windows 10+ он встроен — "
+            "проверьте PATH или обновите Windows."
+        ) from e
+
+    _register_curl(proc)
+    try:
+        while True:
+            try:
+                proc.wait(timeout=_POLL_SECONDS)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if cancel_check is not None and cancel_check():
+                proc.kill()
+                proc.wait(timeout=10)
+                raise DownloadCancelled("Скачивание отменено пользователем")
+        stderr = proc.stderr.read() if proc.stderr else ""
+        return proc.returncode, stderr
+    finally:
+        _unregister_curl(proc)
+        if proc.stderr is not None:
+            try:
+                proc.stderr.close()
+            except OSError:
+                pass
+
+
+def remote_size(url: str) -> Optional[int]:
+    """
+    Размер файла на сервере (HEAD-запрос) или None, если сервер не
+    ответил/не сообщил длину. Нужен, чтобы отличить полностью скачанный
+    архив от оборванного, когда манифеста ещё нет (файлы остались от
+    предыдущей версии программы).
+    """
+    try:
+        proc = subprocess.run(
+            [*_curl_base_args(), "-I", url],
+            capture_output=True, text=True, errors="replace", timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    size: Optional[int] = None
+    for line in proc.stdout.splitlines():
+        if line.lower().startswith("content-length:"):
+            try:
+                size = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                continue
+    return size
+
+
+def download_one(url: str, dest: Path,
+                 cancel_check: Optional[Callable[[], bool]] = None) -> None:
+    """
+    Скачивает один архив. Бросает MISAdapterError с человекочитаемым
+    текстом при неудаче, DownloadCancelled при отмене, FileLockedError
+    если файл держит чужой процесс.
+
+    Пишет в <имя>.part и переименовывает только после проверки
+    целостности. Раньше curl писал сразу в финальное имя, и оборванная
+    закачка оставалась на диске под именем настоящего архива.
+
+    Докачка (-C -) включена: обрыв на 210-м мегабайте из 250 не должен
+    означать «начать заново». Если сервер докачку не поддерживает (код
+    33), .part удаляется и файл качается с нуля — один раз, без
+    зацикливания.
+    """
+    dest = Path(dest)
+    part = dest.with_name(dest.name + ".part")
+
+    for resume in (True, False):
+        args = [*_curl_base_args()]
+        if resume and part.exists() and part.stat().st_size > 0:
+            args += ["-C", "-"]
+            logger.info("Докачиваю %s с %.1f МБ", dest.name,
+                        part.stat().st_size / 1024 ** 2)
+        args += [url, "-o", str(part)]
+
+        try:
+            code, stderr = _run_curl(args, cancel_check)
+        except PermissionError as e:
+            raise FileLockedError(_locked_file_message(part, e)) from e
+
+        if code == 0:
+            break
+        if code == 33 and resume:
+            # Сервер не умеет отдавать кусок с середины — начинаем заново.
+            logger.info("Сервер не поддерживает докачку %s — качаю заново",
+                        dest.name)
+            _safe_unlink(part)
+            continue
+        raise MISAdapterError(
+            f"Не удалось скачать {dest.name}: {curl_error_text(code, stderr)}"
+        )
+
+    if not part.exists() or part.stat().st_size == 0:
+        _safe_unlink(part)
+        raise MISAdapterError(
+            f"Файл {dest.name} скачался пустым или не скачался вовсе."
+        )
+    if not _is_valid_zip(part):
+        size_mb = part.stat().st_size / 1024 ** 2
+        _safe_unlink(part)
+        raise MISAdapterError(
+            f"Файл {dest.name} скачался ({size_mb:.1f} МБ), но не является "
+            f"целым ZIP-архивом — закачка оборвалась либо вместо архива "
+            f"пришла страница с ошибкой."
+        )
+
+    # os.replace атомарен и перезаписывает существующий файл — но на
+    # Windows падает с WinError 32, если цель держит чужой процесс.
+    try:
+        os.replace(part, dest)
+    except PermissionError as e:
+        raise FileLockedError(_locked_file_message(dest, e)) from e
+    except OSError as e:
+        raise MISAdapterError(f"Не удалось сохранить {dest.name}: {e}") from e
 
 
 # ---------------------------------------------------------------------------
@@ -176,10 +556,66 @@ class MISAdapter:
         print("8. Через 10-40 минут придёт письмо со ссылкой")
         print("="*70 + "\n")
 
+    def _existing_file_verdict(self, dest: Path, file_url: str,
+                               known: dict, foreign_job: bool = False) -> str:
+        """
+        Что делать с файлом, который уже лежит в папке результатов:
+        "keep" — точно наш и целый, "adopt" — происхождение неизвестно, но
+        размер сошёлся с сервером, иначе — короткая причина перекачать.
+
+        Три уровня доверия, от дешёвого к дорогому:
+          1. запись в манифесте с той же ссылкой и тем же размером —
+             верим без единого сетевого запроса;
+          2. манифеста нет (файлы от предыдущей версии программы) —
+             спрашиваем у сервера длину и сверяем. Один HEAD-запрос
+             дешевле, чем перекачивать гигабайты, и надёжнее, чем
+             прежнее «валидный ZIP, значит наш»;
+          3. всё остальное — перекачать.
+        """
+        if foreign_job:
+            # Манифест прямо говорит, что папка осталась от ДРУГОГО задания
+            # MIS. Спрашивать у сервера длину бессмысленно и опасно: размеры
+            # архивов разных заданий вполне могут совпасть, и файл был бы
+            # принят как «уже скачанный» — ровно тот баг, из-за которого
+            # распаковка падала с «Wrong password» по всем 23 архивам.
+            return "архив от другого задания MIS"
+
+        try:
+            size = dest.stat().st_size
+        except OSError as e:
+            return f"файл недоступен ({e})"
+        if size == 0:
+            return "нулевой размер"
+
+        record = known.get(dest.name)
+        if record:
+            if record.get("url") != file_url:
+                return "скачан по другой ссылке (другое задание MIS)"
+            if record.get("size") != size:
+                return "размер не совпал с записанным при скачивании"
+            if not _is_valid_zip(dest):
+                return "повреждён (не читается как ZIP)"
+            return "keep"
+
+        # Записи нет — происхождение файла неизвестно. Проверяем по длине
+        # на сервере, а не по одному факту «это валидный ZIP»: архив от
+        # ПРОШЛОГО задания MIS тоже валидный ZIP, но пароль к нему уже
+        # другой, и распаковка упадёт по всем 23 архивам сразу.
+        if not _is_valid_zip(dest):
+            return "повреждён (не читается как ZIP)"
+        expected = remote_size(file_url)
+        if expected is None:
+            return "не удалось сверить размер с сервером"
+        if expected != size:
+            return (f"размер не совпал с сервером "
+                    f"({size} на диске против {expected})")
+        return "adopt"
+
     def download_results(
         self,
         curl_command: str,
         on_file_error: Optional[Callable[[str, str], bool]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> list[Path]:
         """
         Скачивает результаты по curl-команде из письма — БЕЗ bash.
@@ -245,8 +681,8 @@ class MISAdapter:
         logger.info("Получаю скрипт скачивания: %s", script_url)
         try:
             res = subprocess.run(
-                ["curl", "-sL", script_url],
-                capture_output=True, text=True, check=True,
+                ["curl", "-sSfL", "--connect-timeout", "30", script_url],
+                capture_output=True, text=True, errors="replace", check=True,
             )
         except FileNotFoundError as e:
             raise MISAdapterError(
@@ -255,9 +691,10 @@ class MISAdapter:
             ) from e
         except subprocess.CalledProcessError as e:
             raise MISAdapterError(
-                f"Не удалось получить скрипт скачивания (код {e.returncode}). "
-                f"Возможно, срок действия ссылки истёк (результаты на MIS "
-                f"хранятся ~3 дня после письма)."
+                f"Не удалось получить скрипт скачивания: "
+                f"{curl_error_text(e.returncode, e.stderr or '')}.\n"
+                f"Чаще всего это истёкшая ссылка — результаты на MIS "
+                f"хранятся около 3 дней после письма."
             ) from e
 
         script = res.stdout
@@ -318,11 +755,42 @@ class MISAdapter:
             )
 
         logger.info("В скрипте найдено %d архивов, начинаю скачивание...", len(downloads))
+
+        # --- К какому ЗАДАНИЮ относятся файлы, уже лежащие в папке -------
+        # Раньше файл пропускался как «уже скачанный» по одному признаку:
+        # это валидный ZIP. Задание при этом не проверялось никак. Стоило
+        # перезапустить задание на MIS (новый job id и, главное, НОВЫЙ
+        # пароль), как архивы от прошлого задания честно проходили
+        # проверку целостности, пропускались — и распаковка падала с
+        # «Wrong password» сразу по всем 23 архивам, хотя пароль был верный
+        # для нового задания, а файлы лежали от старого.
+        job_id = job_id_from_urls([u for u, _ in downloads])
+        manifest = read_manifest(self.results_dir)
+        known: dict = manifest.get("files") or {}
+        if manifest.get("job") and manifest["job"] != job_id:
+            logger.warning(
+                "⚠ В папке результатов лежат архивы от ДРУГОГО задания MIS "
+                "(%s вместо %s) — они будут перекачаны. Пароль из письма "
+                "подходит только к своему заданию, поэтому оставлять их "
+                "нельзя.", manifest["job"], job_id,
+            )
+            foreign_job = True
+            known = {}
+            for stale in self.results_dir.glob("*.zip.part"):
+                _safe_unlink(stale)
+        else:
+            foreign_job = False
+        manifest = {"job": job_id, "files": known}
+
         already_present = 0
         redownloaded_broken = 0
+        adopted = 0
         failed: list[tuple[str, str]] = []
 
         for file_url, filename in downloads:
+            if cancel_check is not None and cancel_check():
+                raise DownloadCancelled("Скачивание отменено пользователем")
+
             # Нормализация: если regex поймал ссылку без схемы (как у
             # BioDataCatalyst), curl без -L/схемы не поймёт, куда стучаться —
             # сайты MIS/eMIS-семейства HTTPS-only, поэтому дополняем сами.
@@ -330,66 +798,81 @@ class MISAdapter:
                 file_url = "https://" + file_url
             dest = self.results_dir / filename
 
-            # Проверка "уже скачан и цел" — если файл уже лежит на диске
-            # и проходит проверку целостности (валидный ZIP, не только
-            # "непустой"), повторно его не качаем. Битый файл (оборванная
-            # докачка/HTML-страница с ошибкой с прошлого раза) удаляется
-            # и качается заново, как будто его не было.
             if dest.exists():
-                if dest.stat().st_size > 0 and _is_valid_zip(dest):
-                    logger.info("✓ %s уже скачан и цел (%d байт) — пропускаю", filename, dest.stat().st_size)
+                verdict = self._existing_file_verdict(
+                    dest, file_url, known, foreign_job=foreign_job,
+                )
+                if verdict == "keep":
+                    logger.info("✓ %s уже скачан и цел — пропускаю", filename)
                     already_present += 1
+                    known[filename] = {"url": file_url,
+                                       "size": dest.stat().st_size}
+                    write_manifest(self.results_dir, manifest)
+                    continue
+                if verdict == "adopt":
+                    logger.info(
+                        "✓ %s уже лежит на диске, размер совпал с сервером — "
+                        "принимаю как скачанный", filename,
+                    )
+                    adopted += 1
+                    known[filename] = {"url": file_url,
+                                       "size": dest.stat().st_size}
+                    write_manifest(self.results_dir, manifest)
                     continue
                 logger.warning(
-                    "⚠ %s уже есть на диске, но повреждён (не проходит проверку "
-                    "целостности ZIP) — удаляю и качаю заново", filename,
+                    "⚠ %s на диске не подходит (%s) — качаю заново",
+                    filename, verdict,
                 )
-                dest.unlink(missing_ok=True)
+                _safe_unlink(dest)
                 redownloaded_broken += 1
 
+            attempt = 0
             while True:
-                logger.info("Скачиваю: %s", filename)
-                error_msg: Optional[str] = None
+                attempt += 1
+                logger.info("Скачиваю: %s (попытка %d)", filename, attempt)
                 try:
-                    subprocess.run(
-                        ["curl", "-sL", file_url, "-o", str(dest)],
-                        cwd=str(self.results_dir), check=True,
-                    )
-                    if not dest.exists() or dest.stat().st_size == 0:
-                        error_msg = f"Файл {filename} скачался пустым или не скачался вовсе."
-                    elif not _is_valid_zip(dest):
-                        error_msg = (
-                            f"Файл {filename} скачался, но не проходит проверку "
-                            f"целостности ZIP (похоже, скачался HTML-страницей с "
-                            f"ошибкой или обрывом соединения)."
-                        )
-                except subprocess.CalledProcessError as e:
-                    error_msg = f"Ошибка при скачивании {filename}: {e}"
+                    download_one(file_url, dest, cancel_check=cancel_check)
+                    error_msg = None
+                except (DownloadCancelled, FileLockedError):
+                    # Отмена и занятый чужим процессом файл — не тот случай,
+                    # где уместно предлагать «повторить этот файл»: повтор
+                    # упрётся в то же самое. Пробрасываем наружу.
+                    raise
+                except MISAdapterError as e:
+                    error_msg = str(e)
 
                 if error_msg is None:
-                    break  # успех — переходим к следующему файлу
+                    known[filename] = {"url": file_url,
+                                       "size": dest.stat().st_size}
+                    write_manifest(self.results_dir, manifest)
+                    break
 
-                dest.unlink(missing_ok=True)
                 logger.warning("⚠ %s", error_msg)
-
+                if attempt >= MAX_FILE_ATTEMPTS:
+                    error_msg += (
+                        f"\n(исчерпаны {MAX_FILE_ATTEMPTS} попытки — "
+                        f"уже скачанная часть сохранена, следующий запуск "
+                        f"продолжит с этого места)"
+                    )
+                    failed.append((filename, error_msg))
+                    break
                 if on_file_error is not None and on_file_error(filename, error_msg):
-                    # Пользователь (или вызывающий код) попросил повторить
-                    # попытку именно для этого файла — качаем его ещё раз.
                     continue
-
                 failed.append((filename, error_msg))
                 break
 
-        if already_present:
+        write_manifest(self.results_dir, manifest)
+
+        if already_present or adopted:
             logger.info(
-                "✓ Уже было скачано ранее и прошло проверку целостности "
-                "(пропущено): %d из %d файлов",
-                already_present, len(downloads),
+                "✓ Пропущено как уже скачанное: %d (из них принято по "
+                "совпадению размера с сервером: %d) из %d файлов",
+                already_present + adopted, adopted, len(downloads),
             )
         if redownloaded_broken:
             logger.info(
-                "ℹ Обнаружено и перекачано повреждённых файлов с прошлого "
-                "раза: %d", redownloaded_broken,
+                "ℹ Перекачано файлов, не прошедших проверку (битые или от "
+                "другого задания): %d", redownloaded_broken,
             )
 
         zip_files = sorted(self.results_dir.glob("*.zip"))
@@ -400,7 +883,7 @@ class MISAdapter:
                 f"Не удалось скачать {len(failed)} из {len(downloads)} файлов:\n{details}\n\n"
                 f"Уже успешно скачанные и проверенные файлы сохранены в "
                 f"{self.results_dir} — повторный запуск пропустит их и "
-                f"попробует докачать только проблемные."
+                f"продолжит проблемные С МЕСТА ОБРЫВА, а не с нуля."
             )
 
         if not zip_files:

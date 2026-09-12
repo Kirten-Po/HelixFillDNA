@@ -916,7 +916,12 @@ def download_with_urllib(url: str, dest: Path,
 
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=120) as response:
+        # context= — см. core/network_utils.py::make_ssl_context(): без него
+        # на Windows с битым хранилищем корневых сертификатов urlopen падает
+        # ещё до подключения.
+        from core.network_utils import make_ssl_context
+        with urllib.request.urlopen(req, timeout=120,
+                                    context=make_ssl_context()) as response:
             resumed = getattr(response, "status", 200) == 206
             if existing_size > 0 and not resumed:
                 # Сервер не поддержал Range и вернул файл целиком (200) —

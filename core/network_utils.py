@@ -53,7 +53,9 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import ssl
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -71,6 +73,172 @@ CA_BUNDLE_MIN_SIZE = 50 * 1024  # 50 КБ
 
 # Имена curl, которые ищем в bin_dir как потенциально конфликтующие.
 _CURL_BIN_NAMES = ("curl.exe", "curl")
+
+# Последний известный рабочий путь к cacert.pem — заполняется
+# ensure_ca_bundle() и используется find_ca_bundle(), чтобы
+# make_ssl_context() мог найти файл, не зная bin_dir (у urlopen() в
+# main.py его под рукой нет).
+_LAST_CA_BUNDLE: Optional[Path] = None
+
+
+# ---------------------------------------------------------------------------
+# Часть 2.0 — SSLContext для самого Python (urllib), а не только для libcurl
+#
+# Разбор падения "SSLError: not enough data: cadata does not contain a
+# certificate" при скачивании референсного генома (5 попыток, ни одна не
+# открыла сокет):
+#
+#   File "http/client.py",  line 1442, in __init__      <- HTTPSConnection(context=None)
+#   File "ssl.py",          line 775,  in create_default_context
+#   File "ssl.py",          line 596,  in load_default_certs
+#   File "ssl.py",          line 588,  in _load_windows_store_certs
+#   ssl.SSLError: not enough data: cadata does not contain a certificate
+#
+# urlopen() был вызван без context=, поэтому http.client сам делал
+# ssl.create_default_context(). На Windows он идёт в load_default_certs(),
+# который СНАЧАЛА читает хранилище сертификатов Windows:
+#
+#     def _load_windows_store_certs(self, storename, purpose):
+#         certs = bytearray()
+#         for cert, encoding, trust in enum_certificates(storename):
+#             if encoding == "x509_asn" and (trust is True or purpose.oid in trust):
+#                 certs.extend(cert)
+#         if certs:
+#             self.load_verify_locations(cadata=certs)   # <- здесь SSLError
+#
+# Условие "if certs:" прошло — значит записи в хранилище ROOT есть, но
+# OpenSSL не смог разобрать из них ни одного валидного DER-сертификата.
+# Практически это битое/обрезанное хранилище корневых сертификатов: чаще
+# всего последствия установки корня антивирусом с MITM-перехватом
+# (Kaspersky/ESET), VPN-клиентом или групповой политикой, реже —
+# повреждение HKLM\SOFTWARE\Microsoft\SystemCertificates\ROOT\Certificates.
+#
+# ЛОВУШКА: SSL_CERT_FILE здесь НЕ помогает. Эту переменную читает
+# set_default_verify_paths(), который в load_default_certs() вызывается
+# ПОСЛЕ _load_windows_store_certs() — до него выполнение просто не доходит.
+# Единственный способ обойти ветку с хранилищем Windows — передать cafile
+# явно: при заданном cafile create_default_context() вызывает
+# load_verify_locations(cafile), а load_default_certs() не трогает вообще.
+#
+# Ошибка детерминирована: повторы и смена зеркал не помогают в принципе
+# (сокет не открывался ни разу), поэтому вызывающий код (main.py::
+# _download_with_resume) обязан ловить её отдельно и падать сразу, а не
+# жечь 50 секунд на пять заведомо одинаковых попыток.
+# ---------------------------------------------------------------------------
+def find_ca_bundle(bin_dir: Optional[Path] = None) -> Optional[Path]:
+    """
+    Путь к файлу CA-сертификатов, пригодному как cafile= для OpenSSL, или
+    None. Порядок поиска — от самого предсказуемого к запасному:
+
+      1. bin_dir/cacert.pem (или запомненный ensure_ca_bundle() путь, или
+         рабочая директория) — тот же самый файл, что мы уже возим для
+         libcurl/bcftools через CURL_CA_BUNDLE;
+      2. значение CURL_CA_BUNDLE/SSL_CERT_FILE, если они уже выставлены
+         (например, самим ensure_ca_bundle() в этом же процессе);
+      3. certifi.where() — набор сертификатов, идущий с Python-пакетом;
+         в сборке PyInstaller он есть, если .spec собирает данные certifi.
+
+    Файл проверяется на существование и на минимальный размер — обрезанный
+    или подменённый HTML-страницей .pem как cafile хуже, чем его отсутствие
+    (даст ту же самую SSLError, только в другом месте).
+    """
+    candidates: list[Path] = []
+    if bin_dir:
+        candidates.append(Path(bin_dir) / CA_BUNDLE_FILENAME)
+    if _LAST_CA_BUNDLE is not None:
+        candidates.append(_LAST_CA_BUNDLE)
+    candidates.append(Path.cwd() / CA_BUNDLE_FILENAME)
+    for env_name in ("CURL_CA_BUNDLE", "SSL_CERT_FILE"):
+        value = os.environ.get(env_name)
+        if value:
+            candidates.append(Path(value))
+    try:
+        import certifi  # noqa: PLC0415 — опциональная зависимость
+        candidates.append(Path(certifi.where()))
+    except Exception:  # noqa: BLE001 — certifi может отсутствовать в сборке
+        pass
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            key = str(candidate.resolve())
+        except OSError:
+            key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if candidate.is_file() and candidate.stat().st_size >= CA_BUNDLE_MIN_SIZE:
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+class BrokenCertStoreError(RuntimeError):
+    """
+    Хранилище корневых сертификатов Windows непригодно, и запасного
+    cacert.pem тоже нет. Отдельный класс, а не голый RuntimeError, чтобы
+    вызывающий код мог отличить этот детерминированный отказ от обычной
+    сетевой ошибки и НЕ уходить в ретраи (см. main.py::_download_with_resume).
+    """
+
+
+@lru_cache(maxsize=1)
+def make_ssl_context() -> ssl.SSLContext:
+    """
+    Устойчивый SSLContext для urllib — передавайте его как context= в
+    КАЖДЫЙ urlopen() приложения.
+
+    Сначала пробуем обычный ssl.create_default_context(). Если он падает с
+    SSLError (битое хранилище Windows, см. комментарий выше) — берём
+    явный cafile, что полностью обходит ветку load_default_certs().
+
+    lru_cache: контекст строится один раз на процесс — и потому, что это
+    не бесплатно, и потому, что предупреждение в лог должно появиться один
+    раз, а не на каждой из сотен закачек донорских файлов.
+    """
+    try:
+        return ssl.create_default_context()
+    except ssl.SSLError as e:
+        ca = find_ca_bundle()
+        if ca is None:
+            raise BrokenCertStoreError(
+                f"Хранилище корневых сертификатов Windows повреждено или "
+                f"недоступно ({e}), а запасной {CA_BUNDLE_FILENAME} не найден "
+                f"ни в папке бинарников, ни в пакете certifi. Повторные "
+                f"попытки скачивания не помогут — нужно чинить хранилище "
+                f"(см. README, раздел про certutil) или положить "
+                f"{CA_BUNDLE_FILENAME} в папку bin."
+            ) from e
+        logger.warning(
+            "⚠ Хранилище сертификатов Windows непригодно (%s) — "
+            "использую %s", e, ca,
+        )
+        return ssl.create_default_context(cafile=str(ca))
+
+
+def check_windows_cert_store() -> tuple[bool, str]:
+    """
+    Одна строка для диагностики: читается ли системное хранилище.
+    Возвращает (ок, человекочитаемое пояснение). Ничего не чинит и не
+    кэшируется — это именно проба состояния машины на момент нажатия
+    кнопки "Диагностика сети".
+    """
+    try:
+        ssl.create_default_context()
+        return True, "Хранилище сертификатов Windows читается"
+    except ssl.SSLError as e:
+        ca = find_ca_bundle()
+        if ca is None:
+            return False, (
+                f"Хранилище сертификатов Windows битое ({e}), запасной "
+                f"{CA_BUNDLE_FILENAME} НЕ найден — HTTPS-скачивание не "
+                f"заработает"
+            )
+        return False, (
+            f"Хранилище сертификатов Windows битое ({e}) — работаю через {ca}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +266,12 @@ def _download_ca_bundle(dest: Path) -> None:
 
     req = urllib.request.Request(CA_BUNDLE_URL, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
+        # context= обязателен: без него http.client сам вызовет
+        # ssl.create_default_context(), а он на Windows с битым хранилищем
+        # корневых сертификатов падает ещё до открытия сокета — именно тот
+        # случай, ради которого мы сюда и пришли (см. make_ssl_context()).
+        with urllib.request.urlopen(req, timeout=30,
+                                    context=make_ssl_context()) as response:
             resumed = getattr(response, "status", 200) == 206
             mode = "ab" if (resumed and existing_size > 0) else "wb"
             if not resumed:
@@ -186,8 +359,13 @@ def ensure_ca_bundle(bin_dir: Optional[Path]) -> Optional[Path]:
             return None
         logger.info("✓ CA-сертификаты скачаны: %s", ca_path)
 
+    global _LAST_CA_BUNDLE
+    _LAST_CA_BUNDLE = ca_path
     os.environ["CURL_CA_BUNDLE"] = str(ca_path)
     os.environ["SSL_CERT_FILE"] = str(ca_path)
+    # Контекст мог быть построен раньше, до появления этого файла, — сбрасываем
+    # кэш, чтобы следующий вызов увидел свежескачанный набор сертификатов.
+    make_ssl_context.cache_clear()
     return ca_path
 
 

@@ -88,6 +88,7 @@ Source: "app_icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; равно соберётся, а приложение покажет подсказку, куда положить файл.
 Source: "samples\template_v3.txt"; DestDir: "{app}\samples"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "samples\template_v5.txt"; DestDir: "{app}\samples"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "samples\template_genotek.txt"; DestDir: "{app}\samples"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "samples\README.txt"; DestDir: "{app}\samples"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]

@@ -197,6 +197,7 @@ import os
 import pickle
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import time
@@ -238,12 +239,15 @@ from core.pure_python_core import (
     infer_male_from_variants,
 )
 from core.archive_utils import sanitize_password_text
-from core.network_utils import ensure_network_ready
+from core.network_utils import (
+    ensure_network_ready, make_ssl_context, BrokenCertStoreError,
+)
 from core.liftover import ChainLiftover, LiftoverError
 from template.skeleton import extract_skeleton, SkeletonError
 from template.assembler import (
     load_imputed_genotypes, load_measured_genotypes, merge_dictionaries,
     assemble_final, validate_output, AssemblyError,
+    blank_chromosomes, BLANKED_CHROMS,
 )
 from mis_adapter import MISAdapter, MISAdapterError
 
@@ -961,6 +965,26 @@ def _download_with_resume(url: str, dest: Path, max_retries: int = 5) -> None:
         try:
             _download_attempt(current_url, dest)
             return
+        except (ssl.SSLError, BrokenCertStoreError) as e:
+            # Промт "SSLError: not enough data: cadata does not contain a
+            # certificate": ни одна из 5 попыток тогда даже не открыла
+            # сокет — падение происходило на этапе создания SSL-контекста,
+            # ДО подключения. Поэтому и смена зеркал ничего не давала.
+            # Такую ошибку ловим отдельно и падаем сразу, с честным
+            # текстом: отправлять пользователя чинить роутер, когда у него
+            # битое хранилище сертификатов, — вредно.
+            raise RuntimeError(
+                f"Не удалось настроить защищённое соединение: хранилище "
+                f"корневых сертификатов Windows повреждено или недоступно. "
+                f"Повторные попытки и смена зеркал не помогут.\n"
+                f"Подробности: {e}\n\n"
+                f"Как починить (PowerShell от администратора):\n"
+                f"    certutil -generateSSTFromWU %TEMP%\\roots.sst\n"
+                f"    certutil -addstore -f Root %TEMP%\\roots.sst\n"
+                f"Если не помогло — временно отключите проверку HTTPS в "
+                f"антивирусе и проверьте групповые политики "
+                f"(HKLM\\SOFTWARE\\Policies\\Microsoft\\SystemCertificates)."
+            ) from e
         except _MirrorNotFoundError as e:
             last_error = e
             dead.add(current_url)
@@ -1045,7 +1069,13 @@ def _download_attempt(url: str, dest: Path) -> None:
                 headers["Range"] = f"bytes={existing_size}-"
 
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=45) as response:
+            # context= обязателен (промт "SSLError: not enough data"):
+            # без него http.client вызывает ssl.create_default_context(),
+            # который на Windows читает системное хранилище сертификатов и
+            # падает ещё до открытия сокета, если оно битое. См.
+            # core/network_utils.py::make_ssl_context().
+            with urllib.request.urlopen(req, timeout=45,
+                                        context=make_ssl_context()) as response:
                 resumed = getattr(response, "status", 200) == 206
                 content_length = int(response.headers.get("Content-Length", 0))
 
@@ -1148,6 +1178,11 @@ def _download_attempt(url: str, dest: Path) -> None:
             ) from e
         raise RuntimeError(f"Ошибка HTTP при скачивании: {e.code} {e.reason}") from e
     except (_IncompleteDownloadError, _MirrorNotFoundError):
+        raise
+    except (ssl.SSLError, BrokenCertStoreError):
+        # Проблема с сертификатами, а не с сетью: детерминирована, повторы
+        # и смена зеркала не помогут. Пробрасываем как есть — обработка в
+        # _download_with_resume(), где она прекращает цикл попыток.
         raise
     except Exception as e:
         raise RuntimeError(
@@ -1765,6 +1800,7 @@ def download_mis_results_smart(
     results_dir: Path,
     password: str,
     on_file_error: Optional[Callable[[str, str], bool]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> None:
     """
     Скачивает и распаковывает результаты Michigan Imputation Server.
@@ -1808,7 +1844,9 @@ def download_mis_results_smart(
         sevenzip_path=sevenzip_candidate,
     )
 
-    zip_paths = adapter.download_results(curl_command, on_file_error=on_file_error)
+    zip_paths = adapter.download_results(
+        curl_command, on_file_error=on_file_error, cancel_check=cancel_check,
+    )
     print(f"✓ Скачано архивов: {len(zip_paths)}")
 
     try:
@@ -1817,12 +1855,52 @@ def download_mis_results_smart(
     except MISAdapterError as e:
         sanitized = _sanitize_password(password)
         if sanitized == password:
-            raise
+            raise MISAdapterError(_password_failure_hint(str(e), results_dir)) from e
         logger.warning(
             "Распаковка с исходным паролем не удалась (%s). "
             "Пробую ещё раз с очищенным от пробелов/невидимых символов паролем.", e,
         )
-        adapter.extract_all_results(zip_paths, sanitized)
+        try:
+            adapter.extract_all_results(zip_paths, sanitized)
+        except MISAdapterError as e2:
+            raise MISAdapterError(_password_failure_hint(str(e2), results_dir)) from e2
+
+
+#: Признаки того, что 7-Zip/zipfile отвергли именно ПАРОЛЬ, а не файл.
+_PASSWORD_ERROR_MARKERS = ("wrong password", "bad password", "неверный пароль")
+
+
+def _password_failure_hint(message: str, results_dir: Path) -> str:
+    """
+    Дописывает к ошибке распаковки объяснение самой частой её причины.
+
+    Разбор реального отказа: «Wrong password» пришёл СРАЗУ ПО ВСЕМ 23
+    архивам. Пароль, подходящий к одному архиву и не подходящий к
+    остальным, — это опечатка; пароль, не подходящий ни к одному, —
+    это почти всегда пароль ОТ ДРУГОГО ЗАДАНИЯ. Так и было: в папке
+    результатов лежали архивы предыдущего запуска на MIS, они честно
+    проходили проверку целостности, пропускались как «уже скачанные» —
+    и распаковывались паролем от нового письма.
+
+    Сама причина устранена в mis_adapter.py (манифест скачивания
+    привязывает архивы к заданию), но подсказка полезна и для случаев,
+    когда файлы попали в папку мимо программы.
+    """
+    low = message.lower()
+    if not any(marker in low for marker in _PASSWORD_ERROR_MARKERS):
+        return message
+    return (
+        f"{message}\n\n"
+        f"Если пароль не подошёл СРАЗУ КО ВСЕМ архивам — дело, скорее "
+        f"всего, не в опечатке, а в том, что архивы и пароль от разных "
+        f"заданий MIS. Пароль приходит своим письмом на каждое задание и "
+        f"к архивам другого задания не подходит.\n"
+        f"Что проверить:\n"
+        f"  1. письмо, из которого скопирован пароль, — то же самое, что "
+        f"и письмо с curl-командой;\n"
+        f"  2. если запускали задание на сервере повторно — удалите "
+        f"старые архивы из папки {results_dir} и скачайте заново."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2792,7 +2870,13 @@ def _parse_args():
                               "следующий свободный номер (1, 2, 3, ...). На Этапе 7 укажите "
                               "ТО ЖЕ имя, что было напечатано на Этапе 1-6 этого человека — "
                               "иначе Этап 7 не найдёт parse_result.pkl/upload/ от нужного запуска.")
-    parser.add_argument("--format", choices=["v3", "v5"], default="v3")
+    parser.add_argument(
+        "--format", choices=["v3", "v5", "genotek"], default="v3",
+        help=("Оформление итогового файла. v3 — LF, v5 — CRLF (настоящие "
+              "экспорты 23andMe). genotek — трафарет из позиций реальных "
+              "файлов Генотека (621 566 строк, 98,5 % их чипа против "
+              "91,1 % у v5 и 30,7 % у v3), оформление то же, что у v5. "
+              "Трафарет указывается через --template."))
     parser.add_argument("--rsq-threshold", type=float, default=0.30)
     parser.add_argument("--post-merge-intersect", action="store_true", default=True,
                          help="Диагностический post-merge intersect (Задача C, включён по умолчанию)")
@@ -2821,7 +2905,58 @@ def _parse_args():
                               "дополнительно ~десятки ГБ на диске. Это main.py CLI сам не "
                               "скачивает доноров (см. --run-name/[3/7] в докстринге файла) "
                               "— флаг только влияет на текст подсказки и на run_info.json.")
+    parser.add_argument(
+        "--preflight", action="store_true", default=False,
+        help=("Промт 'состояние исходника': один проход по --csv до начала "
+              "пайплайна — call rate чипа общий и по хромосомам, аутосомная "
+              "гетерозиготность, пол по X и по Y, наличие Y/MT, дубли и "
+              "порядок позиций, сборка генома (сверкой с --template), доля "
+              "палиндромных гетерозигот. Плюс состав чипа по частотам "
+              "1000 Genomes и рекомендация панели, если кэш доноров уже "
+              "скачан. Ничего не качает и ничего не меняет в поведении "
+              "пайплайна — только печатает отчёт."))
+    parser.add_argument(
+        "--preflight-only", action="store_true", default=False,
+        help="Напечатать отчёт --preflight и выйти, не запуская пайплайн.")
     return parser.parse_args()
+
+
+def run_preflight(args) -> int:
+    """
+    Печатает отчёт о состоянии исходника и (если есть кэш доноров) состав
+    чипа с рекомендацией панели. Возвращает код возврата для
+    --preflight-only: 0 — замечаний нет или они несущественны, 1 — есть
+    серьёзные замечания. Ненулевой код позволяет вставить проверку в
+    скрипт пакетной обработки, а не читать её глазами.
+    """
+    from core import panel_advisor, preflight
+
+    worst = "ok"
+    try:
+        report = preflight.analyse_file(
+            Path(args.csv), args.source, template_path=Path(args.template),
+        )
+        print(preflight.format_report(report))
+        worst = report.worst_level
+    except Exception as e:  # noqa: BLE001 — отчёт не должен ронять запуск
+        print(f"⚠ Отчёт о состоянии исходника не построен: {e}")
+
+    try:
+        cache = panel_advisor.find_donor_cache(Path(args.donors_dir), args.source)
+        if cache is None:
+            print("ℹ Состав чипа не посчитан: кэш доноров ещё не скачан — "
+                  "он появится после первого скачивания доноров.")
+        else:
+            comp = panel_advisor.analyse_chip(
+                cache, bcftools_path=HTSLIB.bcftools_path if HTSLIB else None,
+            )
+            print(panel_advisor.format_recommendation(
+                panel_advisor.recommend_panel(comp)
+            ))
+    except Exception as e:  # noqa: BLE001
+        print(f"ℹ Состав чипа не посчитан: {e}")
+
+    return 1 if worst == "bad" else 0
 
 
 def main() -> None:
@@ -2880,6 +3015,15 @@ def main() -> None:
 
     if not Path(args.csv).exists():
         sys.exit(f"ОШИБКА: файл с данными не найден: {args.csv}")
+
+    # Промт "состояние исходника": стоит здесь — после проверки, что файл
+    # существует, и ДО ensure_reference_genome(), которая может качать и
+    # хешировать гигабайты. Весь смысл отчёта в том, чтобы увидеть
+    # проблему раньше, чем на неё потрачены час трафика и сутки очереди.
+    if args.preflight or args.preflight_only:
+        code = run_preflight(args)
+        if args.preflight_only:
+            sys.exit(code)
 
     panel_cfg = _panel_config(args.panel)
     print(f"ℹ Референсная панель: {panel_cfg['display_name']}")

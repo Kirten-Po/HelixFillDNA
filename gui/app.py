@@ -323,6 +323,9 @@ _DONOR_PCT_RE = re.compile(r"(\d{1,3})(?:[.,]\d+)?\s*%")
 
 # Как часто опрашивать размеры файлов доноров на диске, мс.
 _DONOR_WATCH_INTERVAL_MS = 1500
+# Пороги показа активных закачек живут в core/download_watch.py
+# (ACTIVE_GRACE_SECONDS / STALLED_SECONDS) — вместе с логикой, которая
+# ими пользуется, и с тестами на неё.
 
 
 def _fmt_size(num_bytes: float) -> str:
@@ -469,12 +472,44 @@ SIMPLE_FORMAT_BY_SOURCE = {
     "ftdna": "v3", "myheritage": "v5", "ancestry": "v3", "vcf": "v3",
 }
 SIMPLE_RSQ = "0.30"          # стандартный порог MIS
+# Нижняя граница подбора порога Rsq — дублирует core.rsq_tuner.RSQ_FLOOR
+# ровно для того, чтобы её можно было показать в подсказке интерфейса
+# до импорта пайплайна.
+SIMPLE_TARGET_RSQ_FLOOR = 0.10
 SIMPLE_EUR_COUNT = 20        # компромисс трафик/качество для обычного режима
 SIMPLE_NORMALIZE = True      # нормализовать multiallelic-сайты перед split
 SIMPLE_RAW_CACHE = True      # хранить сырые хромосомы 1000 Genomes
 
 # Имена трафаретов в папке samples/ — по одному на формат вывода.
-SAMPLE_TEMPLATE_NAMES = {"v3": "template_v3.txt", "v5": "template_v5.txt"}
+SAMPLE_TEMPLATE_NAMES = {
+    "v3": "template_v3.txt",
+    "v5": "template_v5.txt",
+    # Промт "родной трафарет Генотека": собран из пересечения позиций трёх
+    # реальных VCF от Генотека (621 566 строк — 98,5 % их чипа по
+    # аутосомам и X). Смысл в том, что сравнение с родными данными
+    # Генотека идёт по пересечению наборов позиций: файл в оформлении v3
+    # отдаёт их чипу лишь 30,7 % себя, v5 — 91,1 %, а этот трафарет —
+    # 98,5 %. Оформление у него v5-шное (CRLF, шапка 23andMe v5).
+    #
+    # Ни Y, ни MT в трафарете нет. Y — потому что её нет и у чипа
+    # Генотека, и мы её всё равно очищаем (BLANKED_CHROMS). MT — потому
+    # что координаты митохондрии у Генотека в системе hg19/Yoruba
+    # (NC_001807), а не rCRS (NC_012920), на которой сидят 23andMe и все
+    # потребительские чипы: сверка по rsID с чипом Genera дала 13
+    # совпадений из 842 при систематическом сдвиге +1/+2, тогда как та же
+    # Genera против template_v5 совпала 173 раза из 174. Попасть в такие
+    # строки не мог бы ни один источник.
+    "genotek": "template_genotek.txt",
+}
+
+#: Подписи форматов в выпадающем списке. Ключ формата — ПЕРВОЕ слово
+#: подписи: на этом держатся и _get_format_key(), и подстановка пресета в
+#: _apply_simple_presets() (value.startswith(fmt)).
+FORMAT_LABELS = {
+    "v3": "v3 (LF, ~97% call rate)",
+    "v5": "v5 (CRLF, ~92% call rate)",
+    "genotek": "genotek (CRLF, 98,5% чипа Генотека)",
+}
 
 # Выбранный режим переживает перезапуск программы: маленький JSON рядом с
 # exe, а не реестр/AppData — программа и так держит свои данные (donors/,
@@ -486,6 +521,8 @@ SAMPLES_README = """Папка samples — трафареты для сборк�
 Положите сюда файлы:
     template_v3.txt  — трафарет для источника FTDNA Family Finder (формат v3, LF)
     template_v5.txt  — трафарет для источника MyHeritage (формат v5, CRLF)
+    template_genotek.txt — трафарет из позиций реальных файлов Генотека
+                       (621 566 строк, оформление как у v5: CRLF)
 
 Трафарет — это реальный экспорт 23andMe соответствующей версии: программа
 берёт из него порядок и набор rsid/позиций, а генотипы подставляет ваши.
@@ -542,6 +579,38 @@ def _find_sample_template(fmt: str) -> Path | None:
     return None
 
 
+def _os_display_name() -> str:
+    """
+    Человекочитаемое имя ОС для отчёта об ошибке.
+
+    platform.release() на Windows 11 возвращает "10" — Microsoft не меняла
+    major-версию ядра, "11" существует только как маркетинговое имя, порог
+    которого — номер сборки 22000. Из-за этого в присланных отчётах стояло
+    "Windows 10 (10.0.26200)", хотя у пользователя Windows 11 25H2, и триаж
+    уводило не туда. Определяем по номеру сборки, как это делает сама
+    система в winver.
+    """
+    import platform
+    try:
+        system = platform.system()
+        release = platform.release()
+        version = platform.version()
+        if system == "Windows":
+            build = 0
+            try:
+                build = int(sys.getwindowsversion().build)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    build = int(version.split(".")[2])
+            if build >= 22000:
+                release = "11"
+            if build:
+                return f"Windows {release} (сборка {build}, {version})"
+        return f"{system} {release} ({version})"
+    except Exception:
+        return "неизвестно"
+
+
 def _load_ui_mode() -> str:
     """Режим вкладки "Подготовка" из прошлого запуска (по умолчанию — обычный)."""
     try:
@@ -575,6 +644,13 @@ import download_donors
 from adapters.ftdna_v3 import ReferenceGenome
 from core import archive_utils
 from core import network_utils
+from core import updater
+from core import preflight
+from core import panel_advisor
+from core import rsq_tuner
+from core import metrics_log
+from core.download_watch import DownloadWatcher
+import mis_adapter
 
 
 # ---------------------------------------------------------------------------
@@ -1005,10 +1081,18 @@ class App(ctk.CTk):
         # (скачивание результатов на Шаге 3). От этого зависит, в какую
         # панель писать — сам механизм опроса общий.
         self._watch_target = "donors"
-        self._donor_file_sizes: dict[Path, tuple[float, int]] = {}
+        # Кто из файлов на диске реально растёт — считает отдельный,
+        # тестируемый объект (core/download_watch.py), а не этот класс.
+        self._download_watcher = DownloadWatcher()
         self._donor_watch_id = None
         # Путь к последнему собранному итоговому файлу (в results/).
         self._last_result_path: Path | None = None
+        # Промт "состояние исходника + выбор панели": отчёт пре-флайта и
+        # рекомендация панели текущего запуска — нужны не самому запуску, а
+        # строке в runs_metrics.csv, которая пишется в конце Шага 3, когда
+        # окно пре-флайта давно закрыто.
+        self._preflight_report = None
+        self._panel_recommendation = None
 
         # Промт "обычные / продвинутые настройки": папка с трафаретами
         # создаётся программой сама при первом запуске, чтобы в обычном
@@ -1029,6 +1113,11 @@ class App(ctk.CTk):
             fg_color="transparent", border_width=1,
             command=self._open_feedback_dialog,
         ).pack(side="right")
+        ctk.CTkButton(
+            footer, text="⭯ Проверить обновления", width=190,
+            fg_color="transparent", border_width=1,
+            command=lambda: self._run_update_check(force=True),
+        ).pack(side="right", padx=(0, 8))
 
         self.tabview = ctk.CTkTabview(self)
         self.tabview.pack(fill="both", expand=True, padx=10, pady=10)
@@ -1042,6 +1131,145 @@ class App(ctk.CTk):
         self._build_log_tab()
 
         self._poll_logs()
+
+        # Проверка обновлений на GitHub — с задержкой, чтобы окно успело
+        # отрисоваться раньше, чем начнётся сетевой запрос.
+        self.after(1500, lambda: self._run_update_check(force=False))
+
+    # -----------------------------------------------------------------------
+    # Проверка обновлений (промт "проверять новые версии на GitHub")
+    # -----------------------------------------------------------------------
+    def _run_update_check(self, force: bool = False):
+        """
+        Запускает проверку в ФОНОВОМ потоке — сетевой запрос к GitHub на
+        медленном канале не должен подвешивать окно на старте. Результат
+        возвращается в главный поток через self.after(0, ...), как и все
+        остальные thread-safe диалоги этого класса.
+
+        force=True — пользователь нажал кнопку "Проверить обновления":
+        тогда отвечаем и когда обновлений нет, и когда проверка выключена
+        или эта версия была ранее пропущена (см. updater.check_for_update).
+        При автоматической проверке при старте молчим во всех этих
+        случаях — навязчивое окно "у вас последняя версия" на каждом
+        запуске никому не нужно.
+        """
+        def _worker():
+            info = updater.check_for_update(
+                __version__, UI_STATE_FILE, force=force,
+            )
+            if info is not None:
+                self.after(0, self._show_update_dialog, info)
+            elif force:
+                self.after(
+                    0, messagebox.showinfo, "Обновления",
+                    f"Установлена последняя версия — {__version__}.\n\n"
+                    f"Если это не так, страница релизов открыта здесь:\n"
+                    f"{updater.RELEASES_PAGE_URL}",
+                )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _show_update_dialog(self, info):
+        """
+        Окно "доступна новая версия". Вызывается ТОЛЬКО из главного потока
+        (через self.after) — Tkinter из фонового потока не переживает.
+
+        Три исхода, и все три сохраняются по-разному:
+          * "Скачать"          — открывает страницу релиза в браузере,
+                                 настройки не трогает (человек, возможно,
+                                 обновится не сейчас — спросим и в
+                                 следующий раз);
+          * "Позже"            — ничего не сохраняет, спросим при
+                                 следующем запуске;
+          * "Пропустить X.Y.Z" — про ЭТУ версию больше не спрашиваем, про
+                                 следующую спросим;
+          * галочка "Больше не напоминать" — выключает проверку целиком
+            (вернуть можно кнопкой "Проверить обновления" в нижней
+            полоске, она игнорирует эту настройку).
+        """
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Доступно обновление")
+        dialog.geometry("640x520")
+        dialog.transient(self)
+        with contextlib.suppress(tk.TclError):
+            dialog.grab_set()
+
+        never_var = ctk.BooleanVar(value=False)
+
+        def _finish(action: str):
+            try:
+                if never_var.get():
+                    updater.disable_update_checks(UI_STATE_FILE)
+                elif action == "skip":
+                    updater.skip_version(UI_STATE_FILE, info.version)
+                if action == "download":
+                    webbrowser.open(info.asset_url or info.page_url)
+            finally:
+                with contextlib.suppress(tk.TclError):
+                    dialog.destroy()
+
+        buttons = ctk.CTkFrame(dialog, fg_color="transparent")
+        buttons.pack(side="bottom", fill="x", padx=15, pady=(0, 15))
+
+        bottom_opts = ctk.CTkFrame(dialog, fg_color="transparent")
+        bottom_opts.pack(side="bottom", fill="x", padx=15, pady=(0, 8))
+        ctk.CTkCheckBox(
+            bottom_opts, text="Больше не напоминать об обновлениях",
+            variable=never_var,
+        ).pack(anchor="w")
+
+        frame = ctk.CTkScrollableFrame(dialog)
+        frame.pack(fill="both", expand=True, padx=15, pady=(15, 5))
+
+        ctk.CTkLabel(
+            frame, text=f"Доступна версия {info.version}",
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            frame, text=f"У вас установлена {__version__}.",
+            text_color="gray60",
+        ).pack(anchor="w", pady=(0, 10))
+
+        if info.asset_name:
+            size = f" ({info.size_mb:.1f} МБ)" if info.asset_size else ""
+            ctk.CTkLabel(
+                frame, text=f"Установщик: {info.asset_name}{size}",
+                text_color="gray60",
+            ).pack(anchor="w", pady=(0, 10))
+
+        if info.notes:
+            ctk.CTkLabel(frame, text="Что изменилось:").pack(anchor="w")
+            notes_box = ctk.CTkTextbox(frame, height=230)
+            notes_box.pack(fill="both", expand=True, pady=(0, 8))
+            notes_box.insert("1.0", info.notes)
+            notes_box.configure(state="disabled")
+            attach_input_features(notes_box)
+
+        ctk.CTkLabel(
+            frame,
+            text=("ℹ Программа ничего не скачивает и не устанавливает сама — "
+                  "кнопка просто откроет страницу релиза в браузере. Ваши "
+                  "настройки, кэш доноров и папки запусков обновление не "
+                  "затрагивает."),
+            justify="left", text_color="gray60", wraplength=560,
+        ).pack(anchor="w")
+
+        ctk.CTkButton(
+            buttons, text="⬇ Открыть страницу загрузки", width=240,
+            command=lambda: _finish("download"),
+        ).pack(side="left")
+        ctk.CTkButton(
+            buttons, text="Позже", width=110,
+            fg_color="transparent", border_width=1,
+            command=lambda: _finish("later"),
+        ).pack(side="right")
+        ctk.CTkButton(
+            buttons, text=f"Пропустить {info.version}", width=180,
+            fg_color="transparent", border_width=1,
+            command=lambda: _finish("skip"),
+        ).pack(side="right", padx=(0, 8))
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: _finish("later"))
 
     # -----------------------------------------------------------------------
     # Вкладка "Подготовка"
@@ -1226,11 +1454,29 @@ class App(ctk.CTk):
         ctk.CTkLabel(adv, text="Формат вывода:").pack(anchor="w")
         self.format_dd = ctk.CTkOptionMenu(
             adv,
-            values=["v3 (LF, ~97% call rate)", "v5 (CRLF, ~92% call rate)"],
+            values=[FORMAT_LABELS[k] for k in ("v3", "v5", "genotek")],
             width=400,
+            command=self._on_format_changed,
         )
-        self.format_dd.set("v3 (LF, ~97% call rate)")
-        self.format_dd.pack(anchor="w", pady=(0, 15))
+        self.format_dd.set(FORMAT_LABELS["v3"])
+        self.format_dd.pack(anchor="w", pady=(0, 5))
+        ctk.CTkLabel(
+            adv,
+            text=("ℹ v3 и v5 — оформление настоящих экспортов 23andMe. "
+                  "«genotek» — трафарет, собранный из позиций реальных "
+                  "файлов Генотека (621 566 строк, аутосомы и X): его смысл "
+                  "в том, что "
+                  "сравнение с родными данными Генотека идёт по пересечению "
+                  "наборов позиций, а там v3 покрывает их чип на 30,7 %, "
+                  "v5 — на 91,1 %, этот — на 98,5 %. Оформлен он как v5 "
+                  "(CRLF, та же шапка). Примет ли его импортёр Генотека — "
+                  "проверяется только опытом: набор маркеров ему незнаком, "
+                  "и если версию 23andMe определяют по маркерам, а не по "
+                  "шапке, файл могут отвергнуть. Запасной вариант — v5.\n"
+                  "При смене формата трафарет из папки samples/ "
+                  "подставляется автоматически."),
+            justify="left", text_color="gray60", wraplength=700,
+        ).pack(anchor="w", pady=(0, 15))
 
         ctk.CTkLabel(
             adv, text="Порог Rsq (качество импутации, от 0 до 1):",
@@ -1259,6 +1505,70 @@ class App(ctk.CTk):
             adv, text="✓ Порог принят: 0.30", text_color="#4CAF50",
         )
         self.rsq_status_lbl.pack(anchor="w", pady=(0, 15))
+
+        # --- Промт "подбор Rsq под целевой call rate" ----------------------
+        # Отказ приёмки (случай GAEVA) был не из-за панели, а из-за недобора
+        # 3,4 п.п. по заполняемости. Смена панели — это новая закачка
+        # доноров, новая очередь MIS и лифтовер; подбор порога — пересчёт по
+        # уже скачанным дозам, стоящий секунды. Поэтому цель задаётся прямо
+        # здесь, рядом с самим порогом, а не прячется в отдельном окне.
+        self.target_cr_var = ctk.BooleanVar(value=False)
+        self.target_cr_cb = ctk.CTkCheckBox(
+            adv,
+            text=("Подобрать порог Rsq под целевую заполняемость итогового "
+                  "файла (call rate)"),
+            variable=self.target_cr_var,
+            command=self._on_target_cr_toggled,
+        )
+        self.target_cr_cb.pack(anchor="w", pady=(0, 5))
+
+        row_target = ctk.CTkFrame(adv, fg_color="transparent")
+        row_target.pack(fill="x", pady=(0, 5))
+        ctk.CTkLabel(row_target, text="Цель, % заполненных строк:").pack(
+            side="left", padx=(0, 10)
+        )
+        self.target_cr_entry = ctk.CTkEntry(
+            row_target, width=100, placeholder_text="напр. 92", state="disabled",
+        )
+        self.target_cr_entry.pack(side="left")
+        self.target_cr_entry.bind("<KeyRelease>", lambda e: self._validate_target_cr_entry())
+
+        self.target_cr_status_lbl = ctk.CTkLabel(
+            adv, text="Порог Rsq берётся из поля выше", text_color="gray60",
+        )
+        self.target_cr_status_lbl.pack(anchor="w", pady=(0, 5))
+        ctk.CTkLabel(
+            adv,
+            text=("ℹ Работает на Шаге 3, по уже скачанным дозам: приложение "
+                  "строит зависимость заполняемости от порога и берёт САМЫЙ "
+                  "ВЫСОКИЙ порог, при котором цель достигнута — занижать "
+                  f"порог сильнее, чем нужно, значит без пользы ухудшать файл. "
+                  f"Ниже {SIMPLE_TARGET_RSQ_FLOOR:.2f} порог не опускается ни "
+                  "при какой цели: там уже не генотипы, а шум. В лог честно "
+                  "пишется, чем заплачено: сколько позиций прошло с Rsq ниже "
+                  "0,30 и какая медиана Rsq у использованных позиций. "
+                  "Повторного задания на MIS не требуется."),
+            justify="left", text_color="gray60", wraplength=700,
+        ).pack(anchor="w", pady=(0, 15))
+
+        # --- Промт "отчёт о состоянии исходника" ---------------------------
+        self.preflight_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            adv,
+            text=("Показывать отчёт о состоянии исходника и рекомендацию "
+                  "панели перед запуском"),
+            variable=self.preflight_var,
+        ).pack(anchor="w", pady=(0, 5))
+        ctk.CTkLabel(
+            adv,
+            text=("ℹ Один проход по вашему файлу и по уже скачанному кэшу "
+                  "доноров, без единой закачки: call rate чипа, "
+                  "гетерозиготность, пол по X и Y, наличие Y и MT, дубли, "
+                  "сборка генома, состав чипа по частотам. Занимает "
+                  "несколько секунд и показывается ДО того, как начнётся "
+                  "скачивание гигабайтов."),
+            justify="left", text_color="gray60", wraplength=700,
+        ).pack(anchor="w", pady=(0, 15))
 
         # Задача C: опциональная нормализация multiallelic-сайтов
         # (bcftools norm -m-both). НЕ входит в критический путь фикса
@@ -1847,6 +2157,11 @@ class App(ctk.CTk):
         self.rsq_entry.delete(0, "end")
         self.rsq_entry.insert(0, SIMPLE_RSQ)
         self._validate_rsq_entry()
+        # Подбор порога под цель — сознательно продвинутая настройка:
+        # она обменивает качество на заполняемость, и это решение
+        # человек должен принимать осознанно, а не получать по умолчанию.
+        self.target_cr_var.set(False)
+        self._on_target_cr_toggled()
 
         self.normalize_var.set(SIMPLE_NORMALIZE)
         self.raw_cache_var.set(SIMPLE_RAW_CACHE)
@@ -1910,6 +2225,56 @@ class App(ctk.CTk):
 
     def _get_rsq_threshold(self) -> float:
         return float(self.rsq_entry.get().strip())
+
+    def _on_target_cr_toggled(self):
+        """Поле цели активно только при включённой галочке."""
+        if self.target_cr_var.get():
+            self.target_cr_entry.configure(state="normal")
+            if not self.target_cr_entry.get().strip():
+                self.target_cr_entry.insert(0, "92")
+            self._validate_target_cr_entry()
+        else:
+            self.target_cr_entry.configure(state="disabled")
+            self.target_cr_status_lbl.configure(
+                text="Порог Rsq берётся из поля выше", text_color="gray60",
+            )
+
+    def _validate_target_cr_entry(self) -> bool:
+        """
+        Цель осмысленна между 50 и 100 %. Верхняя граница исключена
+        специально: 100 % заполняемости не даёт ни один порог, кроме
+        нулевого, а нулевой мы не разрешаем ни при какой цели.
+        """
+        if not self.target_cr_var.get():
+            return True
+        text = self.target_cr_entry.get().strip().replace(",", ".")
+        try:
+            value = float(text)
+            if not (50.0 <= value < 100.0):
+                raise ValueError
+        except ValueError:
+            self.target_cr_entry.configure(border_color="#F44336")
+            self.target_cr_status_lbl.configure(
+                text="✗ Цель должна быть числом от 50 до 99.9",
+                text_color="#F44336",
+            )
+            return False
+        self.target_cr_entry.configure(border_color=("gray70", "gray30"))
+        self.target_cr_status_lbl.configure(
+            text=(f"✓ Подберу самый высокий порог Rsq, дающий не менее "
+                  f"{value:.1f}% заполненных строк"),
+            text_color="#4CAF50",
+        )
+        return True
+
+    def _get_target_call_rate(self) -> float | None:
+        """Цель по заполняемости или None, если подбор выключен."""
+        if not getattr(self, "target_cr_var", None) or not self.target_cr_var.get():
+            return None
+        try:
+            return float(self.target_cr_entry.get().strip().replace(",", "."))
+        except ValueError:
+            return None
 
     def _on_eur_all_toggled(self):
         """
@@ -2024,6 +2389,12 @@ class App(ctk.CTk):
                 return
 
             network_utils.ensure_network_ready(bd)
+            # Промт "SSLError: not enough data": эта проверка диагностировала
+            # бы тот случай за секунду. Хранилище Windows нужно ИМЕННО для
+            # urllib (скачивание референса), libcurl/bcftools его не читают —
+            # поэтому строка отдельная, рядом с CURL_CA_BUNDLE.
+            store_ok, store_msg = network_utils.check_windows_cert_store()
+            lines.append(f"{'✓' if store_ok else '⚠'} {store_msg}")
             ca_ok = bool(os.environ.get("CURL_CA_BUNDLE"))
             lines.append(
                 f"{'✓' if ca_ok else '⚠'} CA-сертификаты (CURL_CA_BUNDLE): "
@@ -2096,8 +2467,40 @@ class App(ctk.CTk):
         )
 
     def _get_format_key(self) -> str:
-        fmt = self.format_dd.get()
-        return "v5" if "v5" in fmt else "v3"
+        """
+        Ключ формата из подписи выпадающего списка. Сравнение по НАЧАЛУ
+        строки, а не поиском подстроки: прежнее `"v5" if "v5" in fmt`
+        сломалось бы на любой подписи, где "v5" встречается в скобках с
+        пояснением (а такая появилась вместе с форматом genotek).
+        """
+        label = self.format_dd.get()
+        for key in FORMAT_LABELS:
+            if label.startswith(key):
+                return key
+        return "v3"
+
+    def _on_format_changed(self, choice: str | None = None):
+        """
+        Смена формата в продвинутом режиме подставляет соответствующий
+        трафарет из samples/. Раньше его приходилось искать кнопкой
+        «Обзор» вручную, и легко было собрать файл в оформлении одного
+        формата по трафарету другого — validate_output() ловил это уже
+        постфактум, сообщением про CRLF.
+
+        Путь, введённый пользователем руками (не из samples/), не
+        трогаем: если человек указал свой трафарет, он знает, что делает.
+        """
+        fmt = self._get_format_key()
+        current = self.tmpl_tf.get().strip()
+        bundled = {str(_find_sample_template(k)) for k in SAMPLE_TEMPLATE_NAMES
+                   if _find_sample_template(k) is not None}
+        if current and current not in bundled:
+            return
+        template = _find_sample_template(fmt)
+        if template is None:
+            return
+        self.tmpl_tf.delete(0, "end")
+        self.tmpl_tf.insert(0, str(template))
 
     def _on_panel_changed(self):
         """
@@ -2508,7 +2911,7 @@ class App(ctk.CTk):
         этот вопрос («оно шевелится или зависло?») пользователь и смотрит.
         """
         self._donor_watch_dirs = [Path(d) for d in dirs if d]
-        self._donor_file_sizes = {}
+        self._download_watcher.reset()
         self._watch_target = target
         if not self._donor_watch_dirs:
             return
@@ -2556,19 +2959,21 @@ class App(ctk.CTk):
 
         now = time.monotonic()
         donors = self._watch_target == "donors"
-        active: list[tuple[str, int, float]] = []
+        entries: list[tuple[Path, int]] = []
         total_files = 0
         total_bytes = 0
         for directory in self._donor_watch_dirs:
             try:
-                entries = list(directory.iterdir())
+                listing = list(directory.iterdir())
             except OSError:
                 continue
-            for path in entries:
+            for path in listing:
                 # На Шаге 1 растут только VCF-файлы доноров; на Шаге 3
                 # приходят zip-архивы MIS и распакованное из них, поэтому
                 # там смотрим на всё подряд.
                 if donors and ".vcf" not in path.name:
+                    continue
+                if path.name == mis_adapter.DOWNLOAD_MANIFEST_NAME:
                     continue
                 try:
                     if not path.is_file():
@@ -2578,34 +2983,40 @@ class App(ctk.CTk):
                     continue
                 total_files += 1
                 total_bytes += size
-                previous = self._donor_file_sizes.get(path)
-                self._donor_file_sizes[path] = (now, size)
-                if previous is None:
-                    continue
-                prev_time, prev_size = previous
-                if size <= prev_size:
-                    continue
-                speed = (size - prev_size) / max(0.001, now - prev_time)
-                active.append((path.name, size, speed))
+                entries.append((path, size))
 
-                match = _DONOR_CHR_RE.search(path.name) if donors else None
-                if match:
-                    chrom = _normalise_donor_chrom(match.group(1))
-                    if chrom is not None:
-                        kind = "индекс" if path.name.endswith(".tbi") else "⬇"
-                        self._set_donor_cell(
-                            chrom,
-                            f"{kind} {_fmt_size(size)} ({_fmt_size(speed)}/с)",
-                            "#42A5F5", _DONOR_RANK_DOWNLOAD,
-                        )
+        # Кто из этих файлов реально РАСТЁТ — считает DownloadWatcher (см.
+        # core/download_watch.py). Логика вынесена туда, потому что здесь,
+        # внутри метода Tk-класса, её нечем было тестировать — и она
+        # дважды подряд выдала строку, означавшую не то, что читалось:
+        # сначала мигание на медленной закачке, потом «0 Б/с — данных нет»
+        # у файла, который на самом деле уже доскачан.
+        active = self._download_watcher.poll(entries, now)
+
+        if donors:
+            for item in active:
+                match = _DONOR_CHR_RE.search(item.path.name)
+                if match is None:
+                    continue
+                chrom = _normalise_donor_chrom(match.group(1))
+                if chrom is None:
+                    continue
+                kind = "индекс" if item.path.name.endswith(".tbi") else "⬇"
+                self._set_donor_cell(
+                    chrom,
+                    f"{kind} {_fmt_size(item.size)} ({_fmt_size(item.speed)}/с)",
+                    "#42A5F5", _DONOR_RANK_DOWNLOAD,
+                )
 
         target_lbl = self.donor_active_lbl if donors else self.mis_files_lbl
         if active:
-            active.sort(key=lambda item: -item[1])
-            lines = [
-                f"⬇ {name} — скачано {_fmt_size(size)}, {_fmt_size(speed)}/с"
-                for name, size, speed in active[:4]
-            ]
+            lines = []
+            for item in active[:4]:
+                line = (f"⬇ {item.display_name} — скачано {_fmt_size(item.size)}, "
+                        f"{_fmt_size(item.speed)}/с")
+                if item.stalled:
+                    line += f" — данных нет {item.idle:.0f} с"
+                lines.append(line)
             if len(active) > 4:
                 lines.append(f"… и ещё {len(active) - 4} файл(ов)")
             if not donors:
@@ -2645,7 +3056,7 @@ class App(ctk.CTk):
         self.donor_active_lbl.configure(text="")
         self.donor_panel.pack_forget()
         self._donor_states = {}
-        self._donor_file_sizes = {}
+        self._download_watcher.reset()
 
     def _update_donor_panel(self, msg: str):
         """
@@ -2844,7 +3255,7 @@ class App(ctk.CTk):
         """
         try:
             import platform
-            os_line = f"{platform.system()} {platform.release()} ({platform.version()})"
+            os_line = _os_display_name()
             arch = platform.machine()
             py = platform.python_version()
         except Exception:
@@ -3349,13 +3760,18 @@ class App(ctk.CTk):
         response_event.wait()
         return response_holder["value"]
 
-    def _show_cancel_donor_btn(self):
+    def _show_cancel_donor_btn(self, what: str = "доноров"):
         """Показывает кнопку остановки — только на том этапе, где она
-        реально работает (скачивание доноров). В остальное время её на
-        экране нет вовсе, а не «есть, но серая»."""
+        реально работает. В остальное время её на экране нет вовсе, а не
+        «есть, но серая».
+
+        what — что именно останавливаем: скачивание доноров (Шаг 1) или
+        результатов MIS (Шаг 3). Механизм один и тот же
+        (threading.Event + kill дочернего curl), меняется только текст."""
         self.cancel_donor_btn.configure(
-            state="normal", text="⏹ Остановить скачивание доноров",
+            state="normal", text=f"⏹ Остановить скачивание {what}",
         )
+        self._cancel_what = what
         self.stop_box.pack(fill="x", pady=(0, 20), after=self.start_btn)
 
     def _hide_cancel_donor_btn(self):
@@ -3376,7 +3792,14 @@ class App(ctk.CTk):
         """
         self._cancel_donor_download.set()
         self.cancel_donor_btn.configure(state="disabled", text="⏳ Останавливаю...")
-        print("⏳ Запрошена отмена скачивания доноров — завершаю текущую операцию...")
+        what = getattr(self, "_cancel_what", "доноров")
+        print(f"⏳ Запрошена отмена скачивания {what} — завершаю текущую операцию...")
+        # Дочерний curl надо снять руками: без этого он продолжит писать в
+        # файл и после «отмены», а на следующем запуске тот же файл окажется
+        # занят чужим процессом ([WinError 32]).
+        killed = mis_adapter.kill_active_curls()
+        if killed:
+            print(f"⏹ Остановлено активных закачек: {killed}")
 
     def _ensure_donors(
         self, source: str, signature: str, positions_json: Path, panel: str,
@@ -3605,6 +4028,25 @@ class App(ctk.CTk):
             return
         self._set_active_run(run_dir, run_name)
 
+        # Отчёт предыдущего запуска сбрасывается ЗДЕСЬ, а не после
+        # использования: иначе, запустив второй файл с выключенным
+        # пре-флайтом, пользователь получил бы в run.log и в
+        # runs_metrics.csv метрики ЧУЖОГО, предыдущего исходника — и
+        # калибровка порогов поехала бы на данных, которых не было.
+        self._preflight_report = None
+        self._panel_recommendation = None
+
+        # Промт "состояние исходника + выбор панели": анализ идёт ДО
+        # запуска этапов — весь его смысл в том, чтобы увидеть проблему
+        # раньше, чем начнётся скачивание гигабайтов и очередь на MIS.
+        if self.preflight_var.get():
+            self._start_preflight()
+        else:
+            self._begin_stages_1_6()
+
+    def _begin_stages_1_6(self):
+        """Собственно старт этапов 1-6 — вынесен из _on_start(), потому что
+        между нажатием кнопки и стартом теперь может быть окно пре-флайта."""
         self.running = True
         self._run_started_at = time.monotonic()
         self.start_btn.configure(state="disabled")
@@ -3615,6 +4057,188 @@ class App(ctk.CTk):
         self._set_wizard_step(1)
         self._refresh_mis_btn_state()
         threading.Thread(target=self._run_stages_1_6, daemon=True).start()
+
+    # -----------------------------------------------------------------------
+    # Пре-флайт: состояние исходника + рекомендация панели
+    # -----------------------------------------------------------------------
+    def _start_preflight(self):
+        """
+        Считает отчёт в ФОНОВОМ потоке (проход по файлу на 750 тыс. строк
+        плюс проход по кэшу доноров — это несколько секунд, замораживать
+        на них окно нельзя) и показывает окно из главного потока.
+        """
+        self.start_btn.configure(state="disabled")
+        self.stage_lbl.configure(text="Анализ исходника (пре-флайт)...")
+        csv_path = Path(self.input_tf.get())
+        source = self._get_source_key()
+        tmpl_raw = self.tmpl_tf.get().strip()
+        tmpl_path = Path(tmpl_raw) if tmpl_raw else None
+        if tmpl_path is not None and not tmpl_path.is_file():
+            tmpl_path = None
+        bin_dir = Path(self.bin_tf.get()) if self.bin_tf.get() else None
+
+        def _log(text: str) -> None:
+            # Пишем прямо в очередь лога, а не через print(): stdout
+            # перенаправляется на вкладку "Лог" только внутри
+            # _run_stages_1_6()/_run_stage_7(), а пре-флайт идёт ДО них —
+            # в собранном оконном exe его вывод не увидел бы никто.
+            self.log_q.put(text + "\n")
+
+        def _worker():
+            report = rec = None
+            error = ""
+            try:
+                report = preflight.analyse_file(
+                    csv_path, source, template_path=tmpl_path,
+                )
+                _log(preflight.format_report(report))
+            except Exception as e:  # noqa: BLE001 — отчёт не критичен
+                error = str(e)
+                _log(f"⚠ Отчёт о состоянии исходника не построен: {e}")
+            try:
+                cache = panel_advisor.find_donor_cache(pipeline.DONORS_DIR, source)
+                if cache is not None:
+                    comp = panel_advisor.analyse_chip(
+                        cache,
+                        bcftools_path=(pipeline.HtslibTools(bin_dir).bcftools_path
+                                       if bin_dir else None),
+                    )
+                    rec = panel_advisor.recommend_panel(comp)
+                    _log(panel_advisor.format_recommendation(rec))
+                else:
+                    _log("ℹ Состав чипа не посчитан: кэш доноров ещё не "
+                         "скачан — рекомендация панели появится со "
+                         "следующего запуска.")
+            except Exception as e:  # noqa: BLE001
+                _log(f"ℹ Состав чипа не посчитан: {e}")
+            self.after(0, self._show_preflight_dialog, report, rec, error)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _show_preflight_dialog(self, report, rec, error: str):
+        """
+        Окно отчёта. Панель предвыбрана по рекомендации, но переключается
+        руками — молчаливый автовыбор плох тем, что потом нельзя
+        разобрать, почему два запуска разошлись.
+        """
+        self.start_btn.configure(state="normal")
+        self.stage_lbl.configure(text="")
+        if report is None and rec is None:
+            messagebox.showwarning(
+                "Пре-флайт",
+                f"Не удалось проанализировать исходник:\n{error}\n\n"
+                f"Это не мешает запуску — этапы 1-6 будут выполнены как "
+                f"обычно.",
+            )
+            self._begin_stages_1_6()
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Состояние исходника и выбор панели")
+        dialog.geometry("900x720")
+        dialog.transient(self)
+        with contextlib.suppress(tk.TclError):
+            dialog.grab_set()
+
+        current_panel = self._get_panel_key()
+        panel_var = ctk.StringVar(
+            value=(rec.panel if rec is not None else current_panel)
+        )
+        proceed = {"go": False}
+
+        def _go():
+            if proceed["go"]:
+                return
+            proceed["go"] = True
+            chosen = panel_var.get()
+            if chosen != current_panel:
+                display = pipeline.REFERENCE_PANELS[chosen]["display_name"]
+                self.panel_dd.set(display)
+                # CTkOptionMenu.set() не вызывает command=, поэтому
+                # предупреждение под списком обновляем явно — тот же приём,
+                # что и при переключении источника из автодетекта.
+                self._on_panel_changed()
+                print(f"ℹ Панель переключена на «{display}» на экране пре-флайта")
+            self._preflight_report = report
+            self._panel_recommendation = rec
+            with contextlib.suppress(tk.TclError):
+                dialog.destroy()
+            self._begin_stages_1_6()
+
+        def _cancel():
+            with contextlib.suppress(tk.TclError):
+                dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", _cancel)
+
+        buttons = ctk.CTkFrame(dialog, fg_color="transparent")
+        buttons.pack(side="bottom", fill="x", padx=15, pady=(0, 15))
+
+        panel_box = ctk.CTkFrame(dialog)
+        panel_box.pack(side="bottom", fill="x", padx=15, pady=(0, 10))
+
+        frame = ctk.CTkScrollableFrame(dialog)
+        frame.pack(fill="both", expand=True, padx=15, pady=(15, 5))
+
+        if report is not None:
+            level_color = {"ok": "#4CAF50", "warn": "#FFA000", "bad": "#F44336"}
+            level_text = {
+                "ok": "Файл выглядит исправным",
+                "warn": "Есть замечания — посмотрите список ниже",
+                "bad": "Есть серьёзные замечания",
+            }
+            ctk.CTkLabel(
+                frame, text=level_text.get(report.worst_level, ""),
+                font=ctk.CTkFont(size=18, weight="bold"),
+                text_color=level_color.get(report.worst_level, "gray60"),
+            ).pack(anchor="w", pady=(0, 10))
+            box = ctk.CTkTextbox(frame, height=380, wrap="word")
+            box.pack(fill="both", expand=True)
+            box.insert("1.0", preflight.format_report(report))
+            box.configure(state="disabled")
+            attach_input_features(box)
+        else:
+            ctk.CTkLabel(
+                frame, text=f"Отчёт по исходнику не посчитан: {error}",
+                text_color="#FFA000", wraplength=800, justify="left",
+            ).pack(anchor="w", pady=(0, 10))
+
+        ctk.CTkLabel(
+            panel_box, text="Референсная панель для этого запуска:",
+            font=ctk.CTkFont(weight="bold"),
+        ).pack(anchor="w", padx=10, pady=(10, 4))
+        if rec is not None:
+            ctk.CTkLabel(
+                panel_box, text=rec.headline, wraplength=840, justify="left",
+            ).pack(anchor="w", padx=10)
+            for c in rec.counter_reasons:
+                ctk.CTkLabel(
+                    panel_box, text=f"⚠ {c}", wraplength=840, justify="left",
+                    text_color="#FFA000",
+                ).pack(anchor="w", padx=10)
+        else:
+            ctk.CTkLabel(
+                panel_box,
+                text=("Состав чипа посчитать не по чему — кэш доноров ещё "
+                      "не скачан. Рекомендация появится со следующего "
+                      "запуска; сейчас панель выбирается вручную."),
+                wraplength=840, justify="left", text_color="gray60",
+            ).pack(anchor="w", padx=10)
+
+        radios = ctk.CTkFrame(panel_box, fg_color="transparent")
+        radios.pack(anchor="w", padx=10, pady=(6, 10))
+        for key, cfg in pipeline.REFERENCE_PANELS.items():
+            ctk.CTkRadioButton(
+                radios, text=cfg["display_name"], variable=panel_var, value=key,
+            ).pack(side="left", padx=(0, 20))
+
+        ctk.CTkButton(
+            buttons, text="▶ Продолжить запуск", width=220, command=_go,
+        ).pack(side="left")
+        ctk.CTkButton(
+            buttons, text="Отмена", width=120,
+            fg_color="transparent", border_width=1, command=_cancel,
+        ).pack(side="right")
 
     def _on_mis(self):
         if self.running:
@@ -3723,6 +4347,18 @@ class App(ctk.CTk):
                 output_dir.mkdir(parents=True, exist_ok=True)
                 print(f"ℹ Папка запуска: {output_dir} (имя запуска: {self.current_run_name!r})")
 
+                # Отчёт пре-флайта считался ДО создания папки запуска, когда
+                # перенаправление stdout в <run_dir>/run.log ещё не работало.
+                # Повторяем его здесь: разбирая потом неудачный запуск, надо
+                # видеть состояние исходника в том же файле, что и всё
+                # остальное, а не искать его в другом месте.
+                if self._preflight_report is not None:
+                    print(preflight.format_report(self._preflight_report))
+                if self._panel_recommendation is not None:
+                    print(panel_advisor.format_recommendation(
+                        self._panel_recommendation
+                    ))
+
                 # --- Задача 2: автодетект источника vs выбранный в GUI --
                 # Вызывается СРАЗУ после проверки, что csv_path существует,
                 # и ДО "[0/7] Проверка референсного генома" — та может
@@ -3778,6 +4414,29 @@ class App(ctk.CTk):
                     # запусков.
                     eur_sample_count=self._get_eur_sample_count() or "all",
                 )
+
+                # Промт "лог метрик для калибровки порогов": метрики
+                # пре-флайта кладутся в run_info.json, а не держатся в
+                # памяти GUI, потому что строка в runs_metrics.csv
+                # дописывается в конце Шага 3 — а он может выполняться в
+                # ДРУГОЙ сессии приложения (кнопка «Продолжить (Шаг 3)»
+                # для запуска из истории), когда окно пре-флайта закрыто
+                # много часов назад вместе со всей памятью процесса.
+                preflight_metrics = {}
+                if self._preflight_report is not None:
+                    preflight_metrics = preflight.metrics_row(self._preflight_report)
+                chip_metrics = {}
+                if self._panel_recommendation is not None:
+                    chip_metrics = panel_advisor.metrics_row(
+                        self._panel_recommendation.composition,
+                        self._panel_recommendation,
+                    )
+                if preflight_metrics or chip_metrics:
+                    pipeline.save_run_info(
+                        output_dir,
+                        preflight_metrics=preflight_metrics or None,
+                        chip_metrics=chip_metrics or None,
+                    )
 
                 # --- Этап 0: приведение файла к оформлению 23andMe v3 ---
                 # Только для источников из
@@ -3903,6 +4562,9 @@ class App(ctk.CTk):
                 # доноров. Запись здесь, ДО проверки кэша на Этапе 3,
                 # делала сравнение сигнатур бессмысленным (кэш от другого
                 # чипа тихо принимался как валидный).
+                pipeline.save_run_info(
+                    output_dir, parse_metrics=metrics_log.parse_result_row(result) or None,
+                )
                 with (output_dir / "parse_result.pkl").open("wb") as f:
                     pickle.dump(result, f)
                 self.after(0, self._set_subprogress, 1, 1.0, "Парсинг завершён")
@@ -4153,15 +4815,30 @@ class App(ctk.CTk):
                 # чем именно качается и распаковывается архив.
                 self.after(0, self._start_file_watch, [results_dir], "mis")
                 # Промт "проверять уже скачанные файлы + предлагать повтор
-                # при ошибке": уже присутствующие в results_dir непустые
-                # файлы пропускаются автоматически (см.
-                # MISAdapter.download_results()), а при сбое скачивания
-                # конкретного файла показывается диалог с предложением
-                # повторить именно его, не прерывая скачивание остальных.
-                pipeline.download_mis_results_smart(
-                    curl, results_dir, pwd,
-                    on_file_error=self._prompt_file_download_retry,
-                )
+                # при ошибке": уже присутствующие в results_dir файлы
+                # пропускаются, только если манифест подтверждает, что они
+                # от ЭТОГО задания MIS (см. MISAdapter.download_results()),
+                # а при сбое скачивания конкретного файла показывается
+                # диалог с предложением повторить именно его, не прерывая
+                # скачивание остальных.
+                #
+                # Кнопка остановки — та же, что на Шаге 1: скачивание
+                # результатов идёт десятками минут, и без неё единственным
+                # способом прервать зависшую закачку было закрыть окно, а
+                # это оставляло живой curl.exe, который продолжал писать в
+                # файл и ронял следующий запуск с [WinError 32].
+                self._cancel_donor_download.clear()
+                self.after(0, self._show_cancel_donor_btn, "результатов")
+                try:
+                    pipeline.download_mis_results_smart(
+                        curl, results_dir, pwd,
+                        on_file_error=self._prompt_file_download_retry,
+                        cancel_check=self._cancel_donor_download.is_set,
+                    )
+                except mis_adapter.DownloadCancelled as e:
+                    raise UserCancelledRun(str(e)) from e
+                finally:
+                    self.after(0, self._hide_cancel_donor_btn)
                 self.after(0, self._stop_file_watch)
                 self.after(0, self.mis_files_box.pack_forget)
                 self.after(0, self._set_stage7_progress, 0.5, "Скачивание завершено, начинаю сборку...")
@@ -4210,12 +4887,35 @@ class App(ctk.CTk):
                             f"не совпадут со скелетом трафарета (GRCh37)."
                         )
 
+                # --- Промт "подбор Rsq под целевой call rate" -------------
+                # Если задана цель по заполняемости, дозы читаются ОДИН раз
+                # с порогом-полом (rsq_tuner.RSQ_FLOOR), а не с выбранным
+                # порогом: иначе позиции, которые могли бы дотянуть файл до
+                # цели, были бы отброшены ещё на чтении, и подбирать стало
+                # бы не из чего. Rsq каждой принятой позиции попутно
+                # складывается в imputed_rsq (параметр rsq_out) — по нему
+                # зависимость "порог -> заполняемость" считается арифметикой,
+                # без повторного запуска bcftools по всем хромосомам.
+                target_call_rate = self._get_target_call_rate()
+                imputed_rsq: dict[str, float] | None = (
+                    {} if target_call_rate is not None else None
+                )
+                load_threshold = rsq_threshold
+                if target_call_rate is not None:
+                    load_threshold = min(rsq_threshold, rsq_tuner.RSQ_FLOOR)
+                    print(
+                        f"ℹ Задана цель по заполняемости {target_call_rate:.1f}% — "
+                        f"читаю дозы с порогом-полом {load_threshold:.2f} и "
+                        f"подберу порог после сборки словарей."
+                    )
+
                 self.after(0, self._set_stage7_progress, 0.6, "Загрузка импутированных генотипов...")
                 imputed = pipeline.load_imputed_genotypes(
                     results_dir, "genotek", panel_pos,
-                    rsq_threshold=rsq_threshold,
+                    rsq_threshold=load_threshold,
                     bcftools_path=pipeline.HTSLIB.bcftools_path,
                     tabix_path=pipeline.HTSLIB.tabix_path,
+                    rsq_out=imputed_rsq,
                 )
 
                 if reverse_liftover is not None:
@@ -4225,6 +4925,19 @@ class App(ctk.CTk):
                         f"ℹ Обратный лифтовер: {len(imputed)} позиций "
                         f"перенесено в GRCh37, {dropped} отброшено"
                     )
+                    # Карта Rsq ключуется теми же "<chrom>_<pos>", что и
+                    # генотипы, поэтому её надо перенести ТЕМ ЖЕ лифтовером,
+                    # иначе после переноса генотипов ни один ключ карты с
+                    # ними не совпадёт и подбор порога тихо решит, что Rsq
+                    # неизвестен у всех позиций. liftback_imputed_genotypes()
+                    # — обычный перекладчик dict[str, str], поэтому значения
+                    # проносим через строку и возвращаем во float.
+                    if imputed_rsq:
+                        lifted_rsq, _ = pipeline.liftback_imputed_genotypes(
+                            {k: repr(v) for k, v in imputed_rsq.items()},
+                            reverse_liftover,
+                        )
+                        imputed_rsq = {k: float(v) for k, v in lifted_rsq.items()}
 
                 with (output_dir / "parse_result.pkl").open("rb") as f:
                     result = pickle.load(f)
@@ -4255,7 +4968,67 @@ class App(ctk.CTk):
                         f"{measured_dropped} отброшено"
                     )
 
+                # --- Y-хромосома в итоговом файле не заполняется ---------
+                # Y не импутируется (на сервер уходят только 1-22 и X), в
+                # файл она попадает единственным путём — прямыми
+                # измерениями чипа. Новые экспорты MyHeritage их содержат,
+                # и блок Y (предпоследний, между X и MT) оказывался
+                # заполнен. Чистим ДО подбора порога Rsq: тот считает
+                # заполняемость по этим же словарям, и если убрать Y
+                # позже, предсказанный call rate разошёлся бы с тем, что
+                # потом посчитает validate_output().
+                measured, blanked_y = pipeline.blank_chromosomes(measured)
+                if blanked_y:
+                    print(
+                        f"ℹ Очищено измеренных позиций "
+                        f"{','.join(sorted(pipeline.BLANKED_CHROMS))}: "
+                        f"{blanked_y} — в итоговом файле они останутся "
+                        f"как «--». Это снижает потолок заполняемости "
+                        f"примерно на {100.0 * blanked_y / max(1, len(skeleton)):.2f} п.п."
+                    )
+
+                tuning = None
+                if target_call_rate is not None and imputed_rsq is not None:
+                    self.after(0, self._set_stage7_progress, 0.8,
+                               "Подбор порога Rsq под целевую заполняемость...")
+                    skeleton_keys = [f"{r.chrom}_{r.pos}" for r in skeleton]
+                    tuning = rsq_tuner.tune(
+                        skeleton_keys, imputed_rsq, set(measured),
+                        target_call_rate=target_call_rate,
+                        baseline=rsq_threshold,
+                    )
+                    print(rsq_tuner.format_result(tuning))
+                    imputed = rsq_tuner.filter_by_threshold(
+                        imputed, imputed_rsq, tuning.chosen_threshold,
+                    )
+                    # Порог, который реально применён, — тот, что подобран.
+                    # Дальше он уходит и в run_info.json, и в имя/лог, чтобы
+                    # два запуска с разным результатом всегда можно было
+                    # развести по записанному порогу, а не гадать.
+                    rsq_threshold = tuning.chosen_threshold
+                    if not tuning.target_reached:
+                        self._prompt_info(
+                            "Цель по заполняемости не достигнута",
+                            f"Заданная цель {target_call_rate:.1f}% не "
+                            f"достигается на этих дозах.\n\n"
+                            f"Максимум при пороге "
+                            f"{rsq_tuner.RSQ_FLOOR:.2f} — "
+                            f"{tuning.max_call_rate:.2f}%. Файл собран с "
+                            f"этим порогом.\n\n"
+                            f"Ниже {rsq_tuner.RSQ_FLOOR:.2f} порог не "
+                            f"опускается: там качество импутации уже не "
+                            f"отличимо от угадывания, и набивать файл "
+                            f"такими вызовами ради процента в отчёте "
+                            f"бессмысленно. Заполняемость здесь упирается "
+                            f"в состав чипа и панель, а не в порог.",
+                        )
+
                 genotypes = pipeline.merge_dictionaries(imputed, measured)
+                # Страховка на случай, если Y когда-нибудь появится и в
+                # импутированных данных: инвариант «в итоговом файле нет
+                # вызовов Y» должен держаться в одном месте, а не
+                # зависеть от того, какие хромосомы уходят на сервер.
+                genotypes, _ = pipeline.blank_chromosomes(genotypes)
 
                 self.after(0, self._set_stage7_progress, 0.85, "Сборка финального файла...")
                 # Промт "итоговый файл в отдельной папке": результат больше
@@ -4278,6 +5051,34 @@ class App(ctk.CTk):
                 self.after(0, self._set_stage7_progress, 0.95, "Проверка результата...")
                 validation = pipeline.validate_output(output_path, tmpl_path, fmt)
                 self.after(0, self._set_stage7_progress, 1.0, "Готово")
+
+                # --- Промт "лог метрик для калибровки порогов" -------------
+                # Одна строка на запуск, рядом с программой. Пороги
+                # пре-флайта, порог редкого хвоста для выбора панели и сам
+                # порог приёмки сейчас можно только зажать между 88 %
+                # (отклонили) и 91,3 % (приняли) — по двум точкам границу не
+                # вывести. Колонка verdict заполняется руками, когда придёт
+                # ответ приёмки; после десятка запусков граница нарисуется
+                # сама. Пишется и при неудачной валидации тоже: неудачный
+                # запуск для калибровки не менее ценен, чем удачный.
+                metrics_row = {
+                    "run_name": self.current_run_name or "",
+                    "app_version": __version__,
+                    "source": run_info.get("source", ""),
+                    "panel": panel,
+                    "format": fmt,
+                    "final_call_rate": round(validation.call_rate, 4),
+                    "final_file": output_path.name,
+                }
+                for key in ("preflight_metrics", "chip_metrics", "parse_metrics"):
+                    saved = run_info.get(key)
+                    if isinstance(saved, dict):
+                        metrics_row.update(saved)
+                metrics_row.update(rsq_tuner.metrics_row(tuning))
+                metrics_row.setdefault("rsq_chosen", round(rsq_threshold, 3))
+                written = metrics_log.append_run(PROJECT_ROOT, metrics_row)
+                if written is not None:
+                    print(f"ℹ Метрики запуска дописаны в {written}")
 
                 if validation.is_valid:
                     short_msg = f"✅ Готово! {output_path.name} (call rate: {validation.call_rate:.2f}%)"
@@ -4322,6 +5123,29 @@ class App(ctk.CTk):
                     self.after(0, lambda m=short_msg: self.stage_lbl.configure(text=m))
                     self.after(0, self._notify_done, False)
 
+        except UserCancelledRun as e:
+            # Отмена — не ошибка: красный крест и «сообщите об ошибке» здесь
+            # только сбивают с толку. Уже скачанные архивы остаются на месте,
+            # следующий запуск продолжит с них.
+            self.after(0, self._log_success, f"⏹ {e}")
+            self.after(
+                0, lambda: self.stage_lbl.configure(
+                    text="⏹ Скачивание остановлено — скачанное сохранено",
+                ),
+            )
+        except mis_adapter.FileLockedError as e:
+            # Файл держит чужой процесс (осиротевший curl.exe от прошлого
+            # запуска). Текст длинный и с инструкцией — его надо ПОКАЗАТЬ
+            # целиком, а не обрезать до 120 символов в строке состояния.
+            full = str(e)
+            self.after(0, self._log_error, f"❌ {full}")
+            self.after(0, messagebox.showerror, "Файл занят другим процессом", full)
+            self.after(
+                0, lambda: self.stage_lbl.configure(
+                    text="❌ Архив занят другим процессом (см. подсказку)",
+                ),
+            )
+            self.after(0, self._notify_done, False)
         except Exception as e:
             full = str(e)
             short = full if len(full) <= 120 else full[:117] + "..."
