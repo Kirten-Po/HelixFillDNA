@@ -331,6 +331,17 @@ def _write_vcf_line(f, v: ParsedVariant, chrom_prefix: str = "",
     "X + позиция в наборе".
     """
     canonical = _normalise_chrom(v.chrom)
+    # Митохондрия — единственная хромосома, которая называется по-разному в
+    # двух сборках: "MT" в GRCh37 и "chrM" (НЕ "chrMT") в GRCh38 analysis
+    # set. Механическое "chr" + "MT" давало несуществующий контиг, после
+    # чего bcftools norm -f падал с
+    #   [E::faidx_adjust_position] The sequence "chrMT" was not found
+    # а в GUI это выглядело просто как "returned non-zero exit status
+    # 4294967295" — stderr не показывался. Поймано живым прогоном на
+    # panel="topmed"; до выпуска 1.3.2 ветка GRCh38 была не по умолчанию,
+    # поэтому баг и не всплывал.
+    if canonical in ("M", "MT"):
+        canonical = "M" if chrom_prefix else "MT"
     chrom = f"{chrom_prefix}{canonical}"
     gt = _vcf_gt(v.gt)
     if haploid_positions and canonical == "X" and int(v.pos) in haploid_positions:

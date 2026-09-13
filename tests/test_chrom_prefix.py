@@ -92,6 +92,29 @@ def test_build_vcf_with_chr_prefix(tmp_path):
         assert parts_with[0] == f"chr{parts_without[0]}"
 
 
+def test_mitochondrion_is_chrM_not_chrMT_with_prefix(tmp_path):
+    """
+    Единственная хромосома, чьё имя не сводится к "префикс + канон":
+    GRCh37 зовёт её MT, а GRCh38 analysis set — chrM. Механическое
+    "chr" + "MT" давало несуществующий контиг, и bcftools norm -f падал с
+    «The sequence "chrMT" was not found», а GUI показывал только код
+    возврата 4294967295.
+    """
+    result = ParseResult()
+    result.variants = [
+        ParsedVariant(rsid="rsMT", chrom="MT", pos=73, ref="A", alt="G", gt="1/1"),
+    ]
+    result.total_measured = 1
+
+    out38 = tmp_path / "b38.vcf"
+    build_vcf(result, out38, compress=False, chrom_prefix="chr")
+    assert _data_lines(out38)[0].split("\t")[0] == "chrM"
+
+    out37 = tmp_path / "b37.vcf"
+    build_vcf(result, out37, compress=False, chrom_prefix="")
+    assert _data_lines(out37)[0].split("\t")[0] == "MT"
+
+
 def test_build_vcf_chrom_prefix_does_not_affect_sort_order(tmp_path):
     """Сортировка вариантов (_chrom_sort_key) работает по каноническому
     имени — порядок строк в файле не должен зависеть от chrom_prefix."""
