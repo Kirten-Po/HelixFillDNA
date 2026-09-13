@@ -4414,7 +4414,17 @@ class App(ctk.CTk):
         if not curl or not pwd:
             messagebox.showwarning("Предупреждение", "Укажите curl-команду и пароль")
             return
-        if not self._validate_rsq_entry():
+        # Проверять надо АКТИВНУЮ метрику, а не всегда Rsq: при выбранном
+        # GP поле Rsq заблокировано и его значение ни на что не влияет, а
+        # вот мусор в поле GP прошёл бы сюда незамеченным и всплыл уже
+        # внутри фонового потока, на середине Этапа 7.
+        if self._get_quality() == "gp":
+            if not self._validate_gp_entry():
+                messagebox.showwarning(
+                    "Предупреждение", "Порог GP должен быть числом от 0.50 до 0.999",
+                )
+                return
+        elif not self._validate_rsq_entry():
             messagebox.showwarning(
                 "Предупреждение", "Порог Rsq должен быть числом от 0.30 до 0.99",
             )
