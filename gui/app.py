@@ -2658,7 +2658,7 @@ class App(ctk.CTk):
         """
         panel = self._get_panel_key()
         cfg = pipeline.REFERENCE_PANELS[panel]
-        if panel == pipeline.DEFAULT_PANEL:
+        if not pipeline._panel_needs_liftover(panel):
             self.panel_warning_lbl.configure(text="")
         else:
             self.panel_warning_lbl.configure(
@@ -4658,14 +4658,14 @@ class App(ctk.CTk):
                         panel, project_root=PROJECT_ROOT,
                         progress_cb=lambda p, t: self.after(0, self._set_subprogress, 1, 0.05 * p, t),
                     )
-                    if panel != pipeline.DEFAULT_PANEL and liftover is None:
+                    if pipeline._panel_needs_liftover(panel) and liftover is None:
                         print(
                             f"⚠ Не удалось построить лифтовер для панели "
                             f"'{panel}' (chain-файл отсутствует в конфигурации) "
                             f"— координаты останутся в GRCh37, результат "
                             f"импутации, скорее всего, будет некорректным."
                         )
-                elif panel != pipeline.DEFAULT_PANEL:
+                elif pipeline._panel_needs_liftover(panel):
                     # Единственное реальное ограничение (source='vcf' не
                     # поддерживает лифтовер, см. pipeline._supports_liftover())
                     # — предупреждаем здесь один раз, где уже известен
@@ -5034,7 +5034,13 @@ class App(ctk.CTk):
                 # разные числа) и МОЛЧА вернёт пустой/почти пустой результат.
                 forward_liftover = None
                 reverse_liftover = None
-                if panel != pipeline.DEFAULT_PANEL:
+                # ⚠ Условие — свойство панели (сборка генома), а НЕ сравнение
+                # с DEFAULT_PANEL. Раньше здесь стояло `panel != DEFAULT_PANEL`
+                # и работало ровно до 1.3.2, где DEFAULT_PANEL сменился с
+                # "hrc" на "topmed": условие молча инвертировалось, лифтовер
+                # для TopMed перестал выполняться, и итоговый файл заполнялся
+                # на ~1 % вместо ~98 % — без единой ошибки в логе.
+                if pipeline._panel_needs_liftover(panel):
                     self.after(0, self._set_stage7_progress, 0.55, "Подготовка лифтовера результата...")
                     forward_liftover = pipeline._build_liftover(panel, direction="forward")
                     reverse_liftover = pipeline._build_liftover(panel, direction="reverse")

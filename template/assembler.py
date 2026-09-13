@@ -31,9 +31,9 @@ QUALITY_RSQ = "rsq"
 #: max(GP) из самих доз — уверенность вызова У ЭТОГО человека В ЭТОЙ позиции.
 QUALITY_GP = "gp"
 
-def _has_format_tag(vcf_path: Path, tag: str, bcftools: str) -> bool:
+def _has_format_tag(vcf_path: Path, tag: str, bcftools: str) -> bool | None:
     """
-    Есть ли FORMAT/<tag> в шапке VCF.
+    Есть ли FORMAT/<tag> в шапке VCF. None — выяснить не удалось.
 
     Проверять обязательно ДО запроса: `bcftools query -f '[%GP]'` на файле
     без этого поля не возвращает точки, а падает с
@@ -41,14 +41,28 @@ def _has_format_tag(vcf_path: Path, tag: str, bcftools: str) -> bool:
     — то есть при `check=True` роняет весь Этап 7. Выгрузки Michigan/TOPMed
     поле GP содержат (FORMAT=GT:DS:GP:HDS), но старые зеркала и чужие
     пайплайны могут отдать дозы без него.
+
+    ⚠ Три исхода, а не два. Если сам вызов bcftools не состоялся (не тот
+    путь к бинарю, файл занят, повреждён), вернуть False было бы враньём:
+    вызывающий код напечатал бы "в дозах нет поля FORMAT/GP" и свалил
+    вину на файл, тогда как поле там есть. Именно так и вышло при первой
+    проверке этой функции — в неё передали строку "bcftools" вместо
+    настроенного HTSLIB.bcftools_path, вызов упал с FileNotFoundError, и
+    сообщение уверенно обвинило выгрузку TopMed. Поэтому "не смогли
+    проверить" — отдельный исход None.
     """
     try:
         header = subprocess.run(
             [bcftools, "view", "-h", str(vcf_path)],
             capture_output=True, text=True, check=True,
         ).stdout
-    except (subprocess.CalledProcessError, OSError):
-        return False
+    except (subprocess.CalledProcessError, OSError) as e:
+        logger.warning(
+            "⚠ Не удалось прочитать шапку %s (%s): %s. Проверить наличие "
+            "FORMAT/%s невозможно, отсечка для этого файла пойдёт по Rsq.",
+            vcf_path.name, type(e).__name__, e, tag,
+        )
+        return None
     return f"##FORMAT=<ID={tag}," in header
 
 
@@ -333,8 +347,11 @@ def _load_one_dose_file(
     # GP запрашивается только если поле реально объявлено в шапке —
     # см. _has_format_tag(): на неизвестном теге bcftools не молчит, а
     # падает, и с check=True это уронило бы весь Этап 7.
-    use_gp = quality == QUALITY_GP and _has_format_tag(vcf_path, "GP", bcftools)
-    if quality == QUALITY_GP and not use_gp:
+    has_gp = _has_format_tag(vcf_path, "GP", bcftools) if quality == QUALITY_GP else False
+    use_gp = has_gp is True
+    if has_gp is False and quality == QUALITY_GP:
+        # Именно "поля нет", а не "не смогли проверить" — про второй случай
+        # уже предупредил сам _has_format_tag(), и вина там не на файле.
         logger.warning(
             "⚠ %s: в дозах нет поля FORMAT/GP — для этого файла фильтрация "
             "откатывается на Rsq >= %.2f. Так отдают дозы старые версии "

@@ -131,3 +131,57 @@ def test_max_gp_parsing():
     assert _max_gp(".") is None               # значения нет -> откат на Rsq
     assert _max_gp("") is None
     assert _max_gp("не число") is None
+
+
+def test_unreadable_header_is_not_reported_as_missing_gp(tmp_path, caplog):
+    """
+    Если сам вызов bcftools не состоялся, это НЕ значит "в дозах нет GP".
+    Сообщение должно винить вызов, а не файл: иначе диагностика уводит в
+    сторону — ровно так и случилось, когда в функцию передали "bcftools"
+    вместо настроенного пути, и предупреждение обвинило выгрузку TopMed,
+    в которой поле GP на самом деле есть.
+    """
+    import logging
+
+    d = _make_dir(tmp_path)
+
+    def run(cmd, *a, **kw):
+        if "view" in cmd and "-h" in cmd:
+            raise FileNotFoundError(2, "Не удается найти указанный файл")
+        return subprocess.CompletedProcess(cmd, 0, stdout=ROWS_NO_GP, stderr="")
+
+    with caplog.at_level(logging.WARNING):
+        with patch("template.assembler.subprocess.run", side_effect=run):
+            got = load_imputed_genotypes(d, quality=QUALITY_GP, gp_threshold=0.90,
+                                         rsq_threshold=0.30)
+
+    # Откат на Rsq состоялся — работа не потеряна.
+    assert got == {"22_200": "CT", "22_300": "AA"}
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "Не удалось прочитать шапку" in text
+    assert "в дозах нет поля FORMAT/GP" not in text
+
+
+def test_has_format_tag_returns_none_when_call_fails(tmp_path):
+    """Три исхода: True (есть), False (нет), None (проверить не удалось)."""
+    from template.assembler import _has_format_tag
+
+    vcf = tmp_path / "chr22.dose.vcf.gz"
+    vcf.write_bytes(b"")
+
+    def ok(cmd, *a, **kw):
+        return subprocess.CompletedProcess(cmd, 0, stdout=HEADER_WITH_GP, stderr="")
+
+    def missing(cmd, *a, **kw):
+        return subprocess.CompletedProcess(cmd, 0, stdout=HEADER_WITHOUT_GP, stderr="")
+
+    def broken(cmd, *a, **kw):
+        raise OSError("bcftools не найден")
+
+    with patch("template.assembler.subprocess.run", side_effect=ok):
+        assert _has_format_tag(vcf, "GP", "bcftools") is True
+    with patch("template.assembler.subprocess.run", side_effect=missing):
+        assert _has_format_tag(vcf, "GP", "bcftools") is False
+    with patch("template.assembler.subprocess.run", side_effect=broken):
+        assert _has_format_tag(vcf, "GP", "bcftools") is None
