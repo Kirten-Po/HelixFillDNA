@@ -1,11 +1,10 @@
 title: HelixFillDNA
 description: >-
-  Конвертация сырых данных ДНК (FTDNA / MyHeritage / AncestryDNA / VCF)
-  в формат 23andMe для импутации и загрузки в Генотек.
+  Конвертация сырых данных ДНК (FTDNA / MyHeritage / AncestryDNA / Атлас /
+  VCF) в формат 23andMe: импутация на TOPMed или HRC и сборка файла для
+  загрузки в Генотек.
 theme: minima
 
-# ⚠ Плейсхолдер: замените <owner> на реальный аккаунт/организацию
-# после публикации репозитория на GitHub.
 url: "https://Kirten-Po.github.io"
 baseurl: "/HelixFillDNA"
 
