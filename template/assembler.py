@@ -1,7 +1,13 @@
 """
 template/assembler.py
 Сборка финального файла по трафарету + 7 проверок из Части 10 гайда.
-С автоматической фильтрацией по Rsq и поддержкой хромосом X, Y, MT.
+С отсечкой ненадёжных импутированных вызовов и поддержкой хромосом X, Y, MT.
+
+Отсекать можно двумя метриками (параметр quality в
+load_imputed_genotypes()): QUALITY_GP — max(GP), уверенность вызова у
+конкретного человека в конкретной позиции, и QUALITY_RSQ — Rsq/R2,
+качество позиции по всей выборке. Почему это разные вопросы и что даёт
+переход — в докстринге самой функции.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -15,6 +21,54 @@ from core.pure_python_core import read_rsq_map
 from .skeleton import SkeletonRow, extract_skeleton
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Метрика качества, по которой отсекаются ненадёжные импутированные вызовы
+# ---------------------------------------------------------------------------
+#: Rsq/R2 из chr*.info.gz — качество ПОЗИЦИИ по всей выборке.
+QUALITY_RSQ = "rsq"
+#: max(GP) из самих доз — уверенность вызова У ЭТОГО человека В ЭТОЙ позиции.
+QUALITY_GP = "gp"
+
+def _has_format_tag(vcf_path: Path, tag: str, bcftools: str) -> bool:
+    """
+    Есть ли FORMAT/<tag> в шапке VCF.
+
+    Проверять обязательно ДО запроса: `bcftools query -f '[%GP]'` на файле
+    без этого поля не возвращает точки, а падает с
+        Error: no such tag defined in the VCF header: FORMAT/GP
+    — то есть при `check=True` роняет весь Этап 7. Выгрузки Michigan/TOPMed
+    поле GP содержат (FORMAT=GT:DS:GP:HDS), но старые зеркала и чужие
+    пайплайны могут отдать дозы без него.
+    """
+    try:
+        header = subprocess.run(
+            [bcftools, "view", "-h", str(vcf_path)],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, OSError):
+        return False
+    return f"##FORMAT=<ID={tag}," in header
+
+
+def _max_gp(raw: str) -> float | None:
+    """
+    max(GP) из строки вида "0.999,0.001,0".
+
+    Возвращает None, если значения нет ("." — bcftools так печатает
+    отсутствующее поле у конкретной записи) или оно нечисловое; вызывающий
+    код в этом случае откатывается на Rsq, а не отбрасывает позицию молча.
+
+    Число компонент не проверяется: у диплоида их три (0/0, 0/1, 1/1), у
+    гаплоида два, и максимум одинаково осмыслен в обоих случаях.
+    """
+    if not raw or raw == ".":
+        return None
+    try:
+        return max(float(x) for x in raw.split(","))
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -90,11 +144,57 @@ def load_imputed_genotypes(
     bcftools_path: str | None = None,
     tabix_path: str | None = None,
     rsq_out: dict[str, float] | None = None,
+    quality: str = QUALITY_RSQ,
+    gp_threshold: float = 0.90,
 ) -> dict[str, str]:
     """
     Загружает импутированные генотипы из chr*.dose.vcf.gz.
-    Автоматически читает chr*.info.gz и отбрасывает варианты с Rsq < rsq_threshold.
     Обрабатывает хромосомы 1-22, X, Y, MT.
+
+    quality — ЧЕМ отсекать ненадёжные вызовы:
+
+      * QUALITY_RSQ ("rsq") — прежнее поведение: Rsq/R2 из chr*.info.gz,
+        порог rsq_threshold;
+      * QUALITY_GP ("gp") — постериорная вероятность вызова (FORMAT/GP
+        в самих дозах), порог gp_threshold.
+
+    Почему это не одна и та же ручка. Rsq — качество ПОЗИЦИИ по всей
+    выборке: доля дисперсии дозировок, которую импутация объясняет. Это
+    метрика из GWAS, где варианты фильтруют для ассоциативного теста.
+    Здесь же задача обратная — вызов ОДНОГО человека в ОДНОЙ позиции, и
+    для неё существует GP.
+
+    Расхождение измерено на реальном прогоне (FTDNA -> трафарет genotek,
+    панель HRC, chr1-22). Позиции, отброшенные порогом Rsq 0,30: 99,6 %
+    из них имеют MAF < 0,1 %, и в 100 % случаев модель ставит там
+    гомозиготу по референсу с max(GP) >= 0,95 (в 99,3 % — >= 0,99). Это
+    не плохо импутированные позиции: при MAF < 0,1 % разброса дозировок
+    нет вовсе, и Rsq уходит в ноль по СТАТИСТИЧЕСКОЙ причине, независимо
+    от того, верен вызов или нет. Тот же эффект, что у DR2 на выборке из
+    пяти образцов в семейном пайплайне.
+
+    Чистый эффект перехода (возврат минус потеря — часть позиций,
+    проходящих по Rsq, имеет низкую уверенность вызова и теперь
+    отсекается) при gp_threshold=0.90:
+
+        трафарет genotek  +2,15 п.п.   (595 655 позиций)
+        трафарет v5       +1,76 п.п.
+        трафарет v3       -0,09 п.п.
+
+    На v3 обмен идёт один к одному: его позиции по большей части
+    импутируются, и среди них много частых вариантов с настоящей
+    неуверенностью вызова (гетерозигота с размазанным GP). Выигрыша по
+    заполняемости там нет — но состав вызовов становится честнее.
+
+    ⚠ Ультраредкие позиции, которые возвращает GP, заполняются вызовом,
+    опирающимся в основном на АПРИОР «вариант редок, значит его нет».
+    Для порога заполняемости приёмки это годится, для медицинской
+    интерпретации — нет.
+
+    Если в дозах нет поля FORMAT/GP (старые выгрузки сервера), для
+    такого файла происходит откат на Rsq с явным предупреждением:
+    bcftools падает с ошибкой на неизвестном теге, поэтому наличие
+    поля проверяется по шапке ДО запроса.
 
     rsq_out (промт "подбор Rsq под целевой call rate"): если передан
     словарь, в него кладётся Rsq КАЖДОГО принятого генотипа под тем же
@@ -124,9 +224,15 @@ def load_imputed_genotypes(
                 vcf_path, info_path, chrom, genotypes, panel_set,
                 rsq_threshold, bcftools, tabix, sample_name, imputed_dir,
                 rsq_out=rsq_out,
+                quality=quality, gp_threshold=gp_threshold,
             )
 
-    logger.info("Загружено %d импутированных генотипов (Rsq >= %.2f)", len(genotypes), rsq_threshold)
+    if quality == QUALITY_GP:
+        logger.info("Загружено %d импутированных генотипов (max(GP) >= %.2f)",
+                    len(genotypes), gp_threshold)
+    else:
+        logger.info("Загружено %d импутированных генотипов (Rsq >= %.2f)",
+                    len(genotypes), rsq_threshold)
     return genotypes
 
 
@@ -169,6 +275,8 @@ def _load_one_dose_file(
     sample_name: str,
     imputed_dir: Path,
     rsq_out: dict[str, float] | None = None,
+    quality: str = QUALITY_RSQ,
+    gp_threshold: float = 0.90,
 ) -> None:
     """Тело прежнего цикла по хромосомам, вынесенное в отдельную функцию:
     для X их теперь может быть несколько файлов на одну хромосому (см.
@@ -221,10 +329,26 @@ def _load_one_dose_file(
             )
 
     # 3. Извлекаем генотипы
+    #
+    # GP запрашивается только если поле реально объявлено в шапке —
+    # см. _has_format_tag(): на неизвестном теге bcftools не молчит, а
+    # падает, и с check=True это уронило бы весь Этап 7.
+    use_gp = quality == QUALITY_GP and _has_format_tag(vcf_path, "GP", bcftools)
+    if quality == QUALITY_GP and not use_gp:
+        logger.warning(
+            "⚠ %s: в дозах нет поля FORMAT/GP — для этого файла фильтрация "
+            "откатывается на Rsq >= %.2f. Так отдают дозы старые версии "
+            "сервера; на текущих выгрузках Michigan/TOPMed поле есть.",
+            vcf_path.name, rsq_threshold,
+        )
+
+    fmt = "%CHROM\t%POS\t%REF\t%ALT\t[%GT]"
+    if use_gp:
+        fmt += "\t[%GP]"
     cmd = [
         bcftools, "query",
         "-s", sample_name,
-        "-f", "%CHROM\t%POS\t%REF\t%ALT\t[%GT]\n",
+        "-f", fmt + "\n",
         str(vcf_path),
     ]
     if panel_set:
@@ -295,10 +419,23 @@ def _load_one_dose_file(
         c_norm = c.replace("chr", "")
         p_int = int(p)
 
-        # === ГЛАВНОЕ: ПРОВЕРКА Rsq ===
+        # === ГЛАВНОЕ: ОТСЕЧКА НЕНАДЁЖНЫХ ВЫЗОВОВ ===
+        #
+        # Позиции, которых нет в chr*.info.gz (TYPED_ONLY — реальные
+        # измерения чипа), получают Rsq 1.0: фильтровать в них нечего.
         rsq = rsq_map.get((c_norm, p_int), 1.0)
-        if rsq < rsq_threshold:
-            continue  # Отбрасываем низкокачественные варианты
+        gp_max = _max_gp(parts[5]) if use_gp and len(parts) > 5 else None
+
+        if gp_max is not None:
+            if gp_max < gp_threshold:
+                continue
+            quality_value = gp_max
+        else:
+            # Либо метрика Rsq, либо у этой записи GP не оказалось —
+            # откат на Rsq, а не молчаливый пропуск позиции.
+            if rsq < rsq_threshold:
+                continue
+            quality_value = rsq
 
         if "," in alt:
             continue
@@ -353,7 +490,11 @@ def _load_one_dose_file(
             key = f"{c_norm}_{p_int}"
             genotypes[key] = genotype
             if rsq_out is not None:
-                rsq_out[key] = rsq
+                # ВАЖНО: кладём значение ТОЙ метрики, которой отсекали, —
+                # core/rsq_tuner.py строит кривую "порог -> заполняемость"
+                # по этому словарю, и смешивать в нём Rsq с GP нельзя:
+                # шкалы разные, и подобранный порог оказался бы бессмыслицей.
+                rsq_out[key] = quality_value
         except (IndexError, ValueError):
             continue
 

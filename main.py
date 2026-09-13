@@ -3189,12 +3189,35 @@ def _parse_args():
                               "иначе Этап 7 не найдёт parse_result.pkl/upload/ от нужного запуска.")
     parser.add_argument(
         "--format", choices=["v3", "v5", "genotek"], default="v3",
+        # ⚠ В help-строках argparse знак процента ОБЯЗАН быть удвоен:
+        # _expand_help() прогоняет строку через оператор %, и одиночный
+        # "%" перед кириллицей роняет `main.py --help` целиком с
+        # ValueError: unsupported format character. Так и было с 1.3.0,
+        # когда сюда попали доли покрытия чипа.
         help=("Оформление итогового файла. v3 — LF, v5 — CRLF (настоящие "
               "экспорты 23andMe). genotek — трафарет из позиций реальных "
-              "файлов Генотека (621 566 строк, 98,5 % их чипа против "
-              "91,1 % у v5 и 30,7 % у v3), оформление то же, что у v5. "
+              "файлов Генотека (621 566 строк, 98,5 %% их чипа против "
+              "91,1 %% у v5 и 30,7 %% у v3), оформление то же, что у v5. "
               "Трафарет указывается через --template."))
-    parser.add_argument("--rsq-threshold", type=float, default=0.30)
+    parser.add_argument(
+        "--quality", choices=["gp", "rsq"], default="gp",
+        help=("Чем отсекать ненадёжные импутированные вызовы. gp (по "
+              "умолчанию) — max(GP) из доз: вероятность того, что генотип "
+              "У ЭТОГО человека В ЭТОЙ позиции верен. rsq — Rsq/R2 из "
+              "chr*.info.gz: качество позиции по всей выборке (метрика из "
+              "GWAS). Rsq уходит в ноль на ультраредких вариантах по "
+              "статистической причине и отбрасывает позиции, где модель "
+              "уверена на 99 %%; замер на реальном прогоне FTDNA: переход "
+              "на GP даёт +2,15 п.п. заполняемости на трафарете genotek, "
+              "+1,76 на v5 и -0,09 на v3."))
+    parser.add_argument(
+        "--gp-threshold", type=float, default=0.90,
+        help=("Порог max(GP) при --quality gp. 0.90 — консервативный край "
+              "колена кривой «порог -> заполняемость»: при 0.99 выигрыш "
+              "падает до +0,48 п.п., при 0.85 растёт до +2,32, при 0.80 — "
+              "до +2,42, дальше прирост почти останавливается."))
+    parser.add_argument("--rsq-threshold", type=float, default=0.30,
+                         help="Порог Rsq при --quality rsq.")
     parser.add_argument("--post-merge-intersect", action="store_true", default=True,
                          help="Диагностический post-merge intersect (Задача C, включён по умолчанию)")
     parser.add_argument("--normalize", action="store_true", default=False,
@@ -3326,6 +3349,8 @@ def main() -> None:
         panel=args.panel,
         csv_filename=Path(args.csv).name,
         format=args.format,
+        quality=args.quality,
+        gp_threshold=args.gp_threshold,
         rsq_threshold=args.rsq_threshold,
         normalize=args.normalize,
         reuse_donors_across_people=args.reuse_donors_across_people,

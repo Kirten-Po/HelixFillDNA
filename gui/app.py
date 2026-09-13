@@ -478,7 +478,27 @@ SIMPLE_FORMAT_BY_SOURCE = {
     # 621 566), v5 — 82,7 %, v3 — 18,7 %.
     "atlas": "genotek",
 }
-SIMPLE_RSQ = "0.30"          # стандартный порог MIS
+#: Метрика отсечки в обычном режиме. GP — уверенность вызова у ЭТОГО
+#: человека в ЭТОЙ позиции; Rsq — качество позиции по всей выборке
+#: (метрика из GWAS). Замер на реальном прогоне FTDNA -> genotek: переход
+#: даёт +2,15 п.п. заполняемости на трафарете genotek и +1,76 на v5,
+#: потому что Rsq отбрасывал ультраредкие позиции, где модель уверенно
+#: ставит гомозиготу по референсу (99,6 % таких позиций имеют MAF<0,1 %,
+#: и в 100 % случаев max(GP) >= 0,95). Подробности — в докстринге
+#: template/assembler.py::load_imputed_genotypes().
+#: Подписи метрик в выпадающем списке. Ключ — то, что уходит в пайплайн
+#: (template.assembler.QUALITY_GP / QUALITY_RSQ), значение — что видит
+#: пользователь.
+QUALITY_LABELS = {
+    "gp": "GP — уверенность вызова (рекомендуется)",
+    "rsq": "Rsq — качество позиции",
+}
+QUALITY_BY_LABEL = {v: k for k, v in QUALITY_LABELS.items()}
+
+SIMPLE_QUALITY = "gp"
+SIMPLE_GP = "0.90"           # порог max(GP): там кривая выполаживается
+SIMPLE_GP_FLOAT = float(SIMPLE_GP)
+SIMPLE_RSQ = "0.30"          # стандартный порог MIS (запасная метрика)
 # Нижняя граница подбора порога Rsq — дублирует core.rsq_tuner.RSQ_FLOOR
 # ровно для того, чтобы её можно было показать в подсказке интерфейса
 # до импорта пайплайна.
@@ -1487,7 +1507,51 @@ class App(ctk.CTk):
         ).pack(anchor="w", pady=(0, 15))
 
         ctk.CTkLabel(
-            adv, text="Порог Rsq (качество импутации, от 0 до 1):",
+            adv, text="Чем отсекать ненадёжные вызовы:",
+            font=ctk.CTkFont(weight="bold"),
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            adv,
+            text=("GP — вероятность того, что генотип У ЭТОГО человека В ЭТОЙ "
+                  "позиции определён верно.\n"
+                  "Rsq — качество позиции по всей выборке; метрика пришла из "
+                  "GWAS, где варианты отбирают для\nассоциативного теста, а не "
+                  "вызывают генотип одному человеку.\n"
+                  "Разница не теоретическая: Rsq уходит в ноль на ультраредких "
+                  "вариантах по статистической\nпричине — там нет разброса "
+                  "дозировок, — и отбрасывает позиции, где модель уверена на "
+                  "99 %.\n"
+                  "Замер на реальном прогоне FTDNA: переход на GP даёт "
+                  "+2,15 п.п. заполняемости на трафарете\ngenotek и +1,76 на "
+                  "v5. На v3 обмен идёт один к одному."),
+            justify="left", text_color="gray60", wraplength=700,
+        ).pack(anchor="w", pady=(4, 8))
+
+        row_q = ctk.CTkFrame(adv, fg_color="transparent")
+        row_q.pack(fill="x", pady=(0, 5))
+        ctk.CTkLabel(row_q, text="Метрика:").pack(side="left", padx=(0, 10))
+        self.quality_dd = ctk.CTkOptionMenu(
+            row_q, width=320,
+            values=[QUALITY_LABELS["gp"], QUALITY_LABELS["rsq"]],
+            command=lambda _v: self._on_quality_changed(),
+        )
+        self.quality_dd.set(QUALITY_LABELS["gp"])
+        self.quality_dd.pack(side="left")
+
+        row_gp = ctk.CTkFrame(adv, fg_color="transparent")
+        row_gp.pack(fill="x", pady=(6, 5))
+        ctk.CTkLabel(row_gp, text="Порог GP:").pack(side="left", padx=(0, 10))
+        self.gp_entry = ctk.CTkEntry(row_gp, width=100, placeholder_text="0.90")
+        self.gp_entry.insert(0, SIMPLE_GP)
+        self.gp_entry.pack(side="left")
+        self.gp_entry.bind("<KeyRelease>", lambda e: self._validate_gp_entry())
+        self.gp_status_lbl = ctk.CTkLabel(
+            adv, text=f"✓ Порог принят: {float(SIMPLE_GP):.2f}", text_color="#4CAF50",
+        )
+        self.gp_status_lbl.pack(anchor="w", pady=(0, 15))
+
+        ctk.CTkLabel(
+            adv, text="Порог Rsq (запасная метрика, от 0 до 1):",
             font=ctk.CTkFont(weight="bold"),
         ).pack(anchor="w")
         rsq_info = (
@@ -1542,7 +1606,7 @@ class App(ctk.CTk):
         self.target_cr_entry.bind("<KeyRelease>", lambda e: self._validate_target_cr_entry())
 
         self.target_cr_status_lbl = ctk.CTkLabel(
-            adv, text="Порог Rsq берётся из поля выше", text_color="gray60",
+            adv, text="Порог берётся из поля выбранной метрики выше", text_color="gray60",
         )
         self.target_cr_status_lbl.pack(anchor="w", pady=(0, 5))
         ctk.CTkLabel(
@@ -1693,7 +1757,8 @@ class App(ctk.CTk):
             justify="left", text_color="gray60", wraplength=700,
         ).pack(anchor="w", pady=(0, 15))
 
-        for entry in (self.input_tf, self.tmpl_tf, self.bin_tf, self.rsq_entry):
+        for entry in (self.input_tf, self.tmpl_tf, self.bin_tf,
+                      self.rsq_entry, self.gp_entry):
             attach_input_features(entry)
 
         # Первичная синхронизация предупреждения под панель по умолчанию.
@@ -2168,9 +2233,20 @@ class App(ctk.CTk):
                 self.format_dd.set(value)
                 break
 
+        # Обычный режим отсекает по GP: это уверенность вызова у самого
+        # человека, а не качество позиции по выборке. Оба поля порога
+        # выставляются на умолчания, активным остаётся поле выбранной
+        # метрики — см. _on_quality_changed().
+        self.quality_dd.set(QUALITY_LABELS[SIMPLE_QUALITY])
+        self.gp_entry.configure(state="normal")
+        self.gp_entry.delete(0, "end")
+        self.gp_entry.insert(0, SIMPLE_GP)
+        self._validate_gp_entry()
+        self.rsq_entry.configure(state="normal")
         self.rsq_entry.delete(0, "end")
         self.rsq_entry.insert(0, SIMPLE_RSQ)
         self._validate_rsq_entry()
+        self._on_quality_changed()
         # Подбор порога под цель — сознательно продвинутая настройка:
         # она обменивает качество на заполняемость, и это решение
         # человек должен принимать осознанно, а не получать по умолчанию.
@@ -2210,7 +2286,8 @@ class App(ctk.CTk):
                 f"    • референсная панель: {panel_display}\n"
                 f"    • формат вывода: {fmt} "
                 f"({'CRLF' if fmt == 'v5' else 'LF'})\n"
-                f"    • порог Rsq: {SIMPLE_RSQ}\n"
+                f"    • отсечка: max(GP) >= {SIMPLE_GP} "
+                f"(уверенность вызова, не качество позиции)\n"
                 f"    • нормализация multiallelic-сайтов перед split: включена\n"
                 f"    • хранение сырых хромосом 1000 Genomes: включено\n"
                 f"    • число EUR-доноров: {SIMPLE_EUR_COUNT} "
@@ -2240,6 +2317,45 @@ class App(ctk.CTk):
     def _get_rsq_threshold(self) -> float:
         return float(self.rsq_entry.get().strip())
 
+    def _get_quality(self) -> str:
+        """Ключ выбранной метрики отсечки: "gp" или "rsq"."""
+        return QUALITY_BY_LABEL.get(self.quality_dd.get(), SIMPLE_QUALITY)
+
+    def _get_gp_threshold(self) -> float:
+        return float(self.gp_entry.get().strip())
+
+    def _get_quality_threshold(self) -> float:
+        """Порог ТОЙ метрики, которая выбрана, — одним вызовом."""
+        if self._get_quality() == "gp":
+            return self._get_gp_threshold()
+        return self._get_rsq_threshold()
+
+    def _validate_gp_entry(self) -> bool:
+        text = self.gp_entry.get().strip()
+        try:
+            value = float(text)
+        except ValueError:
+            value = -1.0
+        # Нижняя граница — rsq_tuner.GP_FLOOR: ниже 0.50 самый вероятный
+        # генотип перестаёт быть вероятнее всех остальных вместе взятых.
+        if not (0.50 <= value <= 0.999):
+            self.gp_entry.configure(border_color="#F44336")
+            self.gp_status_lbl.configure(
+                text="⚠ Введите число от 0.50 до 0.999", text_color="#F44336",
+            )
+            return False
+        self.gp_entry.configure(border_color=("gray70", "gray30"))
+        self.gp_status_lbl.configure(
+            text=f"✓ Порог принят: {value:.2f}", text_color="#4CAF50",
+        )
+        return True
+
+    def _on_quality_changed(self):
+        """Показать, какое поле порога сейчас работает, а какое игнорируется."""
+        is_gp = self._get_quality() == "gp"
+        self.gp_entry.configure(state="normal" if is_gp else "disabled")
+        self.rsq_entry.configure(state="disabled" if is_gp else "normal")
+
     def _on_target_cr_toggled(self):
         """Поле цели активно только при включённой галочке."""
         if self.target_cr_var.get():
@@ -2250,7 +2366,7 @@ class App(ctk.CTk):
         else:
             self.target_cr_entry.configure(state="disabled")
             self.target_cr_status_lbl.configure(
-                text="Порог Rsq берётся из поля выше", text_color="gray60",
+                text="Порог берётся из поля выбранной метрики выше", text_color="gray60",
             )
 
     def _validate_target_cr_entry(self) -> bool:
@@ -3289,7 +3405,9 @@ class App(ctk.CTk):
             f"Источник данных: {self.source_dd.get()}",
             f"Референсная панель: {self.panel_dd.get()}",
             f"Формат вывода: {self._get_format_key()}",
-            f"Порог Rsq: {self.rsq_entry.get().strip()}",
+            (f"Порог GP: {self.gp_entry.get().strip()}"
+             if self._get_quality() == "gp"
+             else f"Порог Rsq: {self.rsq_entry.get().strip()}"),
             f"EUR-доноров: {eur_text}",
             f"Нормализация multiallelic: {'да' if self.normalize_var.get() else 'нет'}",
             f"Кэш сырых хромосом: {'да' if self.raw_cache_var.get() else 'нет'}",
@@ -4816,6 +4934,10 @@ class App(ctk.CTk):
     # -----------------------------------------------------------------------
     def _run_stage_7(self):
         rsq_threshold = self._get_rsq_threshold()
+        # Метрика отсечки и её порог читаются в ГЛАВНОМ потоке, до ухода в
+        # фоновый, — как и всё остальное, что берётся из виджетов.
+        quality = self._get_quality()
+        quality_threshold = self._get_quality_threshold()
         fmt = self._get_format_key()
         output_path = None
         # Промт "Именованные папки запуска": та же папка запуска, что
@@ -4947,19 +5069,25 @@ class App(ctk.CTk):
                 imputed_rsq: dict[str, float] | None = (
                     {} if target_call_rate is not None else None
                 )
-                load_threshold = rsq_threshold
+                q_floor, _, q_label = rsq_tuner.settings_for(quality)
+                load_threshold = quality_threshold
                 if target_call_rate is not None:
-                    load_threshold = min(rsq_threshold, rsq_tuner.RSQ_FLOOR)
+                    load_threshold = min(quality_threshold, q_floor)
                     print(
                         f"ℹ Задана цель по заполняемости {target_call_rate:.1f}% — "
-                        f"читаю дозы с порогом-полом {load_threshold:.2f} и "
-                        f"подберу порог после сборки словарей."
+                        f"читаю дозы с порогом-полом {load_threshold:.2f} по "
+                        f"{q_label} и подберу порог после сборки словарей."
                     )
 
                 self.after(0, self._set_stage7_progress, 0.6, "Загрузка импутированных генотипов...")
                 imputed = pipeline.load_imputed_genotypes(
                     results_dir, "genotek", panel_pos,
-                    rsq_threshold=load_threshold,
+                    # Порог уходит в тот параметр, который соответствует
+                    # выбранной метрике; второй остаётся на своём
+                    # умолчании и в этой ветке не используется.
+                    rsq_threshold=(load_threshold if quality == "rsq" else rsq_threshold),
+                    gp_threshold=(load_threshold if quality == "gp" else SIMPLE_GP_FLOAT),
+                    quality=quality,
                     bcftools_path=pipeline.HTSLIB.bcftools_path,
                     tabix_path=pipeline.HTSLIB.tabix_path,
                     rsq_out=imputed_rsq,
@@ -5037,12 +5165,13 @@ class App(ctk.CTk):
                 tuning = None
                 if target_call_rate is not None and imputed_rsq is not None:
                     self.after(0, self._set_stage7_progress, 0.8,
-                               "Подбор порога Rsq под целевую заполняемость...")
+                               f"Подбор порога {q_label} под целевую заполняемость...")
                     skeleton_keys = [f"{r.chrom}_{r.pos}" for r in skeleton]
                     tuning = rsq_tuner.tune(
                         skeleton_keys, imputed_rsq, set(measured),
                         target_call_rate=target_call_rate,
-                        baseline=rsq_threshold,
+                        baseline=quality_threshold,
+                        metric=quality,
                     )
                     print(rsq_tuner.format_result(tuning))
                     imputed = rsq_tuner.filter_by_threshold(
@@ -5052,17 +5181,19 @@ class App(ctk.CTk):
                     # Дальше он уходит и в run_info.json, и в имя/лог, чтобы
                     # два запуска с разным результатом всегда можно было
                     # развести по записанному порогу, а не гадать.
-                    rsq_threshold = tuning.chosen_threshold
+                    quality_threshold = tuning.chosen_threshold
+                    if quality == "rsq":
+                        rsq_threshold = tuning.chosen_threshold
                     if not tuning.target_reached:
                         self._prompt_info(
                             "Цель по заполняемости не достигнута",
                             f"Заданная цель {target_call_rate:.1f}% не "
                             f"достигается на этих дозах.\n\n"
                             f"Максимум при пороге "
-                            f"{rsq_tuner.RSQ_FLOOR:.2f} — "
+                            f"{q_floor:.2f} по {q_label} — "
                             f"{tuning.max_call_rate:.2f}%. Файл собран с "
                             f"этим порогом.\n\n"
-                            f"Ниже {rsq_tuner.RSQ_FLOOR:.2f} порог не "
+                            f"Ниже {q_floor:.2f} порог не "
                             f"опускается: там качество импутации уже не "
                             f"отличимо от угадывания, и набивать файл "
                             f"такими вызовами ради процента в отчёте "
@@ -5122,7 +5253,8 @@ class App(ctk.CTk):
                     if isinstance(saved, dict):
                         metrics_row.update(saved)
                 metrics_row.update(rsq_tuner.metrics_row(tuning))
-                metrics_row.setdefault("rsq_chosen", round(rsq_threshold, 3))
+                metrics_row.setdefault("quality_metric", quality)
+                metrics_row.setdefault("rsq_chosen", round(quality_threshold, 3))
                 written = metrics_log.append_run(PROJECT_ROOT, metrics_row)
                 if written is not None:
                     print(f"ℹ Метрики запуска дописаны в {written}")
@@ -5144,7 +5276,8 @@ class App(ctk.CTk):
                     self.after(0, self._log_success, f"✅ ГОТОВО! Файл: {output_path}")
                     self.after(0, self._log_success, f"   Call rate: {validation.call_rate:.2f}%")
                     self.after(0, self._log_success, f"   Формат: {fmt}")
-                    self.after(0, self._log_success, f"   Порог Rsq: {rsq_threshold:.2f}")
+                    self.after(0, self._log_success,
+                               f"   Порог {q_label}: {quality_threshold:.2f}")
                     if validation.template_duplicate_positions:
                         # Не ошибка сборки (см. докстринг
                         # ValidationResult.template_duplicate_positions в

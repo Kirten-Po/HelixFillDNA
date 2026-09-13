@@ -117,3 +117,73 @@ def test_empty_input_does_not_crash():
     r = rt.tune([], {}, set(), target_call_rate=90.0)
     assert r.achieved_call_rate == 0.0
     assert not r.target_reached
+
+
+# ---------------------------------------------------------------------------
+# Метрика GP: тот же алгоритм, другие пол, точка отсчёта и подпись
+# ---------------------------------------------------------------------------
+def test_tune_takes_floor_and_baseline_from_metric():
+    """
+    Пол и точка отсчёта не задаются вручную: для GP они другие (0.50/0.90
+    против 0.10/0.30), и передавать их на каждом вызове означало бы рано
+    или поздно подобрать порог по чужой шкале.
+    """
+    from core import rsq_tuner
+
+    keys = [f"1_{i}" for i in range(100)]
+    # Половина позиций — уверенные вызовы, половина — размазанные.
+    gp = {f"1_{i}": (0.99 if i % 2 == 0 else 0.62) for i in range(100)}
+
+    r = rsq_tuner.tune(keys, gp, set(), target_call_rate=None, metric="gp")
+    assert r.metric == "gp"
+    assert r.baseline_threshold == rsq_tuner.GP_STANDARD
+    # При пороге 0.90 проходит ровно половина.
+    assert abs(r.baseline_call_rate - 50.0) < 1e-6
+    # Пол сетки — GP_FLOOR, а не RSQ_FLOOR: на 0.50 проходят все.
+    assert abs(r.max_call_rate - 100.0) < 1e-6
+    assert r.curve[0].threshold == rsq_tuner.GP_FLOOR
+
+
+def test_tune_reaches_target_by_lowering_gp_threshold():
+    from core import rsq_tuner
+
+    keys = [f"1_{i}" for i in range(100)]
+    gp = {f"1_{i}": (0.99 if i % 2 == 0 else 0.62) for i in range(100)}
+
+    r = rsq_tuner.tune(keys, gp, set(), target_call_rate=90.0, metric="gp")
+    assert r.target_reached
+    assert r.chosen_threshold <= 0.62 + 1e-9
+    assert r.achieved_call_rate >= 90.0
+
+
+def test_format_result_labels_the_metric():
+    """
+    Подпись обязана называть метрику: 0,30 по Rsq и 0,90 по GP стоят в
+    разных шкалах, и отчёт без имени метрики нечитаем.
+    """
+    from core import rsq_tuner
+
+    keys = [f"1_{i}" for i in range(10)]
+    gp = {k: 0.95 for k in keys}
+    text = rsq_tuner.format_result(
+        rsq_tuner.tune(keys, gp, set(), metric="gp")
+    )
+    assert "max(GP)" in text
+    assert "ПОДБОР ПОРОГА max(GP)" in text
+
+    rsq = {k: 0.8 for k in keys}
+    text_rsq = rsq_tuner.format_result(
+        rsq_tuner.tune(keys, rsq, set(), metric="rsq")
+    )
+    assert "Rsq" in text_rsq and "max(GP)" not in text_rsq
+
+
+def test_metrics_row_records_which_metric():
+    from core import rsq_tuner
+
+    keys = [f"1_{i}" for i in range(10)]
+    row = rsq_tuner.metrics_row(
+        rsq_tuner.tune(keys, {k: 0.95 for k in keys}, set(), metric="gp")
+    )
+    assert row["quality_metric"] == "gp"
+    assert row["rsq_chosen"] == rsq_tuner.GP_STANDARD

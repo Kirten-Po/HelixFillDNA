@@ -1,6 +1,11 @@
 """
 core/rsq_tuner.py
-Подбор порога Rsq под ЦЕЛЕВУЮ заполняемость итогового файла.
+Подбор порога качества под ЦЕЛЕВУЮ заполняемость итогового файла.
+
+Метрик две — Rsq и max(GP), см. METRIC_SETTINGS и параметр metric в
+tune(). Алгоритм у них общий: значения сортируются один раз, и кривая
+"порог -> заполняемость" считается бинарным поиском. Различаются только
+пол, точка отсчёта и подпись — имя модуля историческое.
 
 Зачем это раньше автовыбора панели
 ----------------------------------
@@ -54,6 +59,49 @@ RSQ_STANDARD = 0.30
 #: Шаг сетки перебора.
 RSQ_STEP = 0.01
 
+# ---------------------------------------------------------------------------
+# Вторая метрика качества: max(GP)
+#
+# Кривая "порог -> заполняемость" в build_curve() и tune() не знает, ЧТО за
+# число ей дали: она сортирует значения и режет их бинарным поиском. Поэтому
+# перевод на GP — это не новый алгоритм, а другие пол, точка отсчёта и
+# подпись. Важно лишь, чтобы словарь качества, приходящий из
+# template/assembler.py (параметр rsq_out), содержал ОДНУ метрику: шкалы у
+# Rsq и GP разные, и смешанный словарь дал бы бессмысленный порог.
+# ---------------------------------------------------------------------------
+
+#: Ниже этого порога подбор по GP не опускается. 0,50 — точка, где самый
+#: вероятный генотип перестаёт быть вероятнее всех остальных вместе взятых.
+#: Ровно тот же смысл, что у RSQ_FLOOR: дальше уже не вызовы, а шум.
+GP_FLOOR = 0.50
+
+#: Стандартный порог GP — точка отсчёта, относительно которой считается
+#: "сколько качества заплачено". Выбран по кривой, замеренной на реальном
+#: прогоне (FTDNA -> трафарет genotek, весь геном; чистый эффект перехода
+#: с Rsq 0,30):
+#:
+#:      0,99  +0,48 п.п.        0,85  +2,32 п.п.
+#:      0,95  +1,76 п.п.        0,80  +2,42 п.п.
+#:      0,90  +2,15 п.п.        0,70  +2,54 п.п.
+#:
+#: Колено кривой — около 0,85-0,90: ниже каждая следующая ступень
+#: добавляет всё меньше и состоит из всё менее уверенных вызовов. 0,90 —
+#: консервативный край колена; он же принят в локальном семейном
+#: пайплайне (Beagle, gp=true).
+GP_STANDARD = 0.90
+
+#: Пол, точка отсчёта и подпись для каждой метрики. Всё, чем метрики
+#: различаются в этом модуле.
+METRIC_SETTINGS = {
+    "rsq": (RSQ_FLOOR, RSQ_STANDARD, "Rsq"),
+    "gp": (GP_FLOOR, GP_STANDARD, "max(GP)"),
+}
+
+
+def settings_for(metric: str) -> tuple[float, float, str]:
+    """(пол, точка отсчёта, подпись) для метрики; неизвестная -> Rsq."""
+    return METRIC_SETTINGS.get(metric, METRIC_SETTINGS["rsq"])
+
 
 @dataclass(frozen=True)
 class CurvePoint:
@@ -76,6 +124,10 @@ class TuningResult:
     median_rsq_used: float = 0.0
     total_rows: int = 0
     curve: list[CurvePoint] = field(default_factory=list)
+    #: Какой метрикой подбирали — "rsq" или "gp". Нужна и для подписей, и
+    #: для runs_metrics.csv: без неё столбец с порогом нечитаем, потому
+    #: что 0,30 по Rsq и 0,90 по GP стоят в разных шкалах.
+    metric: str = "rsq"
 
     @property
     def gained_pp(self) -> float:
@@ -151,8 +203,9 @@ def tune(
     measured_keys: set[str],
     *,
     target_call_rate: Optional[float] = None,
-    floor: float = RSQ_FLOOR,
-    baseline: float = RSQ_STANDARD,
+    floor: Optional[float] = None,
+    baseline: Optional[float] = None,
+    metric: str = "rsq",
 ) -> TuningResult:
     """
     Подбирает САМЫЙ ВЫСОКИЙ порог, при котором заполняемость не ниже
@@ -162,7 +215,17 @@ def tune(
 
     target_call_rate=None — режим "только отчёт": порог остаётся
     baseline, но кривая и цена всё равно посчитаны и их можно показать.
+
+    metric — в какой шкале лежат значения imputed_rsq ("rsq" или "gp").
+    floor и baseline по умолчанию берутся из неё; передавать их явно
+    нужно только чтобы переопределить.
     """
+    metric_floor, metric_baseline, _ = settings_for(metric)
+    if floor is None:
+        floor = metric_floor
+    if baseline is None:
+        baseline = metric_baseline
+
     curve, rsq_values, measured_used, total_rows = build_curve(
         skeleton_keys, imputed_rsq, measured_keys, floor=floor,
     )
@@ -173,6 +236,7 @@ def tune(
             achieved_call_rate=0.0,
             baseline_threshold=baseline,
             target_reached=target_call_rate is None,
+            metric=metric,
         )
 
     def _at(threshold: float) -> CurvePoint:
@@ -218,6 +282,7 @@ def tune(
         median_rsq_used=_median(used),
         total_rows=total_rows,
         curve=curve,
+        metric=metric,
     )
 
 
@@ -236,9 +301,10 @@ def filter_by_threshold(genotypes: dict[str, str], imputed_rsq: dict[str, float]
 
 
 def format_result(r: TuningResult) -> str:
+    metric_floor, _, label = settings_for(r.metric)
     lines = [
         "=" * 70,
-        "ПОДБОР ПОРОГА Rsq ПОД ЦЕЛЕВУЮ ЗАПОЛНЯЕМОСТЬ",
+        f"ПОДБОР ПОРОГА {label} ПОД ЦЕЛЕВУЮ ЗАПОЛНЯЕМОСТЬ",
         "=" * 70,
     ]
     if r.target_call_rate is None:
@@ -249,22 +315,22 @@ def format_result(r: TuningResult) -> str:
     else:
         lines.append(
             f"Цель: не ниже {r.target_call_rate:.2f}% — НЕ достигнута. "
-            f"Максимум, что дают эти дозы при пороге {RSQ_FLOOR:.2f}, — "
-            f"{r.max_call_rate:.2f}%. Ниже {RSQ_FLOOR:.2f} порог не "
+            f"Максимум, что дают эти дозы при пороге {metric_floor:.2f}, — "
+            f"{r.max_call_rate:.2f}%. Ниже {metric_floor:.2f} порог не "
             f"опускается сознательно: там уже не генотипы, а шум."
         )
     lines += [
         "",
-        f"Выбранный порог Rsq:      {r.chosen_threshold:.2f}",
+        f"Выбранный порог {label}:  {r.chosen_threshold:.2f}",
         f"Заполняемость:            {r.achieved_call_rate:.2f}%",
         f"Для сравнения, при {r.baseline_threshold:.2f}:  "
         f"{r.baseline_call_rate:.2f}%  "
         f"({r.gained_pp:+.2f} п.п.)",
         "",
         "Чем заплачено:",
-        f"  позиций с Rsq ниже {r.baseline_threshold:.2f} в итоговом файле: "
+        f"  позиций с {label} ниже {r.baseline_threshold:.2f} в итоговом файле: "
         f"{r.below_standard_used:,}".replace(",", " "),
-        f"  медиана Rsq использованных импутированных позиций: "
+        f"  медиана {label} использованных импутированных позиций: "
         f"{r.median_rsq_used:.3f}",
         "=" * 70,
     ]
@@ -275,6 +341,10 @@ def metrics_row(r: Optional[TuningResult]) -> dict:
     if r is None:
         return {}
     return {
+        # ⚠ Столбцы оставлены с прежними именами, чтобы не рвать историю
+        # runs_metrics.csv. Но 0,30 по Rsq и 0,90 по GP — разные шкалы,
+        # поэтому рядом обязательно пишется, чем именно подбирали.
+        "quality_metric": r.metric,
         "rsq_target_call_rate": (round(r.target_call_rate, 2)
                                  if r.target_call_rate is not None else ""),
         "rsq_chosen": round(r.chosen_threshold, 3),
