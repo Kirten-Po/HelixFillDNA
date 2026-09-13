@@ -3179,8 +3179,14 @@ def _parse_args():
     parser.add_argument("--donors-dir", type=Path, default=DONORS_DIR,
                          help="Корень хранилища доноров (внутри — подпапки по --source и --panel)")
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "output",
+                         # ⚠ и прочие символы вне cp1251 в help-строках недопустимы:
+                         # argparse печатает всю справку одним куском, и на
+                         # windows-консоли с кодовой страницей 1251 первый же
+                         # такой символ роняет `main.py --help` целиком через
+                         # UnicodeEncodeError. В логах и print() они безвредны
+                         # — там поток уже настроен на UTF-8.
                          help="Корень для папок запуска (промт 'Именованные папки запуска'). "
-                              "⚠ Breaking change: раньше файлы писались прямо сюда, теперь "
+                              "ВНИМАНИЕ: breaking change — раньше файлы писались прямо сюда, теперь "
                               "реальная рабочая папка запуска — <--output-dir>/runs/<--run-name>/.")
     parser.add_argument("--run-name", type=str, default=None,
                          help="Имя папки запуска внутри <--output-dir>/runs/. По умолчанию — "
@@ -3241,7 +3247,7 @@ def _parse_args():
                               "<genome_build>/, см. raw_chromosome_cache_dir()) в "
                               "инструкции для download_donors.py --raw-cache-dir, чтобы "
                               "второй/третий source/чип не перекачивал заново те же самые "
-                              "многогигабайтные файлы зеркал 1000 Genomes. ⚠ Занимает "
+                              "многогигабайтные файлы зеркал 1000 Genomes. ВНИМАНИЕ: занимает "
                               "дополнительно ~десятки ГБ на диске. Это main.py CLI сам не "
                               "скачивает доноров (см. --run-name/[3/7] в докстринге файла) "
                               "— флаг только влияет на текст подсказки и на run_info.json.")
