@@ -2825,12 +2825,56 @@ class App(ctk.CTk):
         self._set_active_run(run_dir, run_dir.name)
         self._set_wizard_step(2)
         self._refresh_mis_btn_state()
+
+        # Восстановить формат вывода и трафарет из run_info.json этого
+        # запуска.
+        #
+        # ⚠ Зачем. Этап 7 берёт панель из run_info.json, а формат вывода и
+        # трафарет — из ВИДЖЕТОВ. При продолжении запуска после
+        # перезапуска GUI вкладку «Подготовка» никто не трогает, поэтому
+        # поле трафарета оставалось пустым, а формат — каким угодно. Два
+        # последствия, оба скверные: пустое поле давало
+        # `Path("") -> "."` и падение с невнятным
+        # `[Errno 13] Permission denied: '.'` уже ПОСЛЕ распаковки 21 ГБ;
+        # а непустое, но чужое — молча собирало файл по трафарету другого
+        # формата. Оба случая наблюдались вживую.
+        restored = self._restore_format_from_run_info(run_dir)
+
         messagebox.showinfo(
             "Запуск выбран",
             f"Активный запуск: «{run_dir.name}».\n"
-            f"Вставьте curl-команду и пароль из письма MIS и нажмите "
-            f"«📥 Скачать результаты и собрать финальный файл».",
+            + (f"Формат вывода и трафарет восстановлены из запуска: "
+               f"{restored}.\n" if restored else "")
+            + f"Вставьте curl-команду и пароль из письма MIS и нажмите "
+              f"«📥 Скачать результаты и собрать финальный файл».",
         )
+
+    def _restore_format_from_run_info(self, run_dir: Path) -> str | None:
+        """
+        Ставит формат вывода из run_info.json запуска и подтягивает под
+        него трафарет из samples/. Возвращает описание для сообщения или
+        None, если восстановить нечего.
+
+        Пользовательский путь к трафарету не затирается — за это отвечает
+        сам _on_format_changed().
+        """
+        try:
+            info = pipeline.load_run_info(run_dir) or {}
+        except Exception as e:  # noqa: BLE001 — диагностика, не управление
+            logger.warning("Не удалось прочитать run_info.json из %s: %s", run_dir, e)
+            return None
+        fmt = info.get("format")
+        if not fmt:
+            return None
+        for value in self.format_dd.cget("values"):
+            if value.startswith(fmt):
+                self.format_dd.set(value)
+                break
+        else:
+            return None
+        self._on_format_changed()
+        tmpl = self.tmpl_tf.get().strip()
+        return f"{fmt} ({Path(tmpl).name})" if tmpl else fmt
 
     def _on_rename_run(self):
         """Кнопка «✏ Переименовать» — переименовывает папку запуска на
@@ -4413,6 +4457,27 @@ class App(ctk.CTk):
         pwd = self.pwd_tf.get().strip()
         if not curl or not pwd:
             messagebox.showwarning("Предупреждение", "Укажите curl-команду и пароль")
+            return
+        # ⚠ Проверять ДО скачивания, а не полагаться на то, что упадёт
+        # extract_skeleton(): пустое поле даёт Path("") == Path("."), и
+        # чтение каталога как файла роняет Этап 7 с
+        # `[Errno 13] Permission denied: '.'` — уже ПОСЛЕ того, как
+        # скачаны и распакованы десятки гигабайт. Наблюдалось вживую.
+        tmpl_text = self.tmpl_tf.get().strip()
+        if not tmpl_text:
+            messagebox.showwarning(
+                "Не указан трафарет",
+                "Поле «Трафарет» пустое — собирать итоговый файл не по чему.\n\n"
+                "Выберите формат вывода: трафарет из папки samples/ "
+                "подставится автоматически.",
+            )
+            return
+        if not Path(tmpl_text).is_file():
+            messagebox.showwarning(
+                "Трафарет не найден",
+                f"Файл трафарета не найден:\n{tmpl_text}\n\n"
+                f"Проверьте путь или выберите формат вывода заново.",
+            )
             return
         # Проверять надо АКТИВНУЮ метрику, а не всегда Rsq: при выбранном
         # GP поле Rsq заблокировано и его значение ни на что не влияет, а
