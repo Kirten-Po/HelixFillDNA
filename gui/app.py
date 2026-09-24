@@ -5179,6 +5179,7 @@ class App(ctk.CTk):
                     bcftools_path=pipeline.HTSLIB.bcftools_path,
                     tabix_path=pipeline.HTSLIB.tabix_path,
                     rsq_out=imputed_rsq,
+                    require_autosomes=True,
                 )
 
                 if reverse_liftover is not None:
