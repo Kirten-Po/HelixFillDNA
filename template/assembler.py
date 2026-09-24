@@ -160,9 +160,15 @@ def load_imputed_genotypes(
     rsq_out: dict[str, float] | None = None,
     quality: str = QUALITY_RSQ,
     gp_threshold: float = 0.90,
+    require_autosomes: bool = False,
 ) -> dict[str, str]:
     """
     Загружает импутированные генотипы из chr*.dose.vcf.gz.
+
+    require_autosomes — остановиться с AssemblyError, если в imputed_dir
+    нет доз хотя бы одной аутосомы (см. missing_autosome_doses()). Этап 7
+    передаёт True; по умолчанию False, чтобы тесты и диагностика могли
+    работать на подмножестве хромосом.
     Обрабатывает хромосомы 1-22, X, Y, MT.
 
     quality — ЧЕМ отсекать ненадёжные вызовы:
@@ -249,6 +255,20 @@ def load_imputed_genotypes(
     if not imputed_dir.is_dir():
         raise FileNotFoundError(f"Папка с импутированными данными не найдена: {imputed_dir}")
 
+    if require_autosomes:
+        missing = missing_autosome_doses(imputed_dir)
+        if missing:
+            raise AssemblyError(
+                f"В папке результатов нет доз по хромосомам: "
+                f"{', '.join('chr' + c for c in missing)} ({imputed_dir}).\n"
+                f"Без них все позиции этих хромосом, кроме прямых измерений "
+                f"чипа, вышли бы в итоговом файле как '--', и call rate "
+                f"упал бы на несколько процентов без единой ошибки. Обычно "
+                f"так бывает после оборванной распаковки (например, "
+                f"кончилось место на диске). Освободите место и повторите "
+                f"Этап 7 — архивы распакуются заново."
+            )
+
     bcftools = bcftools_path or shutil.which("bcftools") or "bcftools"
     tabix = tabix_path or shutil.which("tabix") or "tabix"
 
@@ -274,6 +294,35 @@ def load_imputed_genotypes(
         logger.info("Загружено %d импутированных генотипов (Rsq >= %.2f)",
                     len(genotypes), rsq_threshold)
     return genotypes
+
+
+#: Хромосомы, дозы которых обязаны быть в результатах. X сюда не входит:
+#: задание могло уйти без неё. Y и MT не импутируются вовсе.
+REQUIRED_DOSE_CHROMS = tuple(str(i) for i in range(1, 23))
+
+
+def missing_autosome_doses(imputed_dir: Path) -> list[str]:
+    """
+    Аутосомы, для которых в imputed_dir нет chrN.dose.vcf.gz (или файл
+    пустой).
+
+    Раньше отсутствие файла хромосомы молча означало «хромосомы нет в
+    результатах» — нормальное объяснение для Y/MT/X, но не для аутосомы.
+    После распаковки, оборванной нехваткой места на диске, пропадала
+    целая хромосома (chr4 — это около 6 % позиций трафарета), итоговый
+    файл собирался без ошибок, а Генотек отклонял его за низкий call rate.
+    """
+    imputed_dir = Path(imputed_dir)
+    missing = []
+    for chrom in REQUIRED_DOSE_CHROMS:
+        vcf = imputed_dir / f"chr{chrom}.dose.vcf.gz"
+        try:
+            ok = vcf.is_file() and vcf.stat().st_size > 0
+        except OSError:
+            ok = False
+        if not ok:
+            missing.append(chrom)
+    return missing
 
 
 # Michigan Imputation Server отдаёт X одним файлом chrX.dose.vcf.gz
